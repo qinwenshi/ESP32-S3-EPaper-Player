@@ -20,7 +20,7 @@
 ```
 e-Paper  MOSI=13  SCK=12  CS=11  DC=10  RST=9  BUSY=8  PWR=6
 SD       CLK=39   CMD=41  D0=40
-I2S      MCLK=14  BCLK=15 LRC=38 DOUT=45
+I2S      MCLK=14  BCLK=15 LRC=38 DOUT=45 DIN=16(mic)
 ES8311   SDA=47   SCL=48
 AUDIO_PWR=42  PA=46  VBAT_LATCH=17
 BOOT_BTN=0  PWR_BTN=35
@@ -73,6 +73,12 @@ make build-flash
 # 仅刷机（使用上次编译产物）
 make flash
 
+# 首次烧录（固件 + 语音模型，一条命令）
+make flash-all
+
+# 单独烧录语音模型（srmodels.bin → 0x400000）
+make flash-model
+
 # 指定串口（默认 /dev/cu.usbmodem21201）
 make flash PORT=/dev/cu.usbmodem12301
 
@@ -102,6 +108,7 @@ arduino-cli compile \
 - **开机免刷屏**：保存上次帧到 SD，重启只做 partial update（仅更新变化像素）
 - **暂停时后台预扫描**：Core 0 任务在暂停期间解析未缓存曲目的 ID3 text 标签，写入 `.meta` 文件
 - NVS 断点续播：每 3 秒记录播放进度，重启后自动恢复
+- **语音控制**：说 "Hi,喵喵" 唤醒，再说指令即可操控播放器（见下方语音控制章节）
 
 ### 按键
 
@@ -113,13 +120,53 @@ arduino-cli compile \
 
 ---
 
+## 语音控制
+
+板载麦克风（ES8311 ADC → GPIO16）配合 Espressif ESP-SR 实现本地离线语音识别，无需网络。
+
+### 唤醒词
+
+> **Hi,喵喵**
+
+说出唤醒词后，串口会打印 `[VOICE] Wake word detected: Hi,喵喵!`，随即进入 6 秒命令识别窗口。
+
+### 指令列表
+
+| 说什么 | 功能 |
+|--------|------|
+| 下一首 | 切到下一首 |
+| 上一首 | 切到上一首 |
+| 暂停   | 暂停播放 |
+| 继续播放 | 恢复播放 |
+| 声音大一点 | 音量 +10 |
+| 声音小一点 | 音量 -10 |
+
+### 技术细节
+
+- 唤醒模型：`wn9_himiaomiao_tts`（WakeNet9，阈值 0.636/0.641）
+- 命令模型：`mn5q8_cn`（MultiNet5 Q8，中文）
+- 模型存储：Flash 0x400000（`model` SPIFFS 分区，3 MB），需单独烧录 `srmodels.bin`
+- 音频流：I2S1 slave 读取 ES8311 ADC（共享 I2S0 的 BCLK/WS），软件线性插值重采样至 16 kHz，AFE 处理后送 WakeNet/MultiNet
+- 语音任务运行在 Core 0，优先级 3，栈 8 KB
+
+### 首次烧录语音模型
+
+```bash
+make flash-all   # 固件 + 模型一次烧录完成
+# 或单独烧录模型（固件已刷时）
+make flash-model
+```
+
+---
+
 ## 分区表
 
 `partitions.csv`（8 MB Flash）：
 
-| 名称 | 类型 | 大小 |
-|------|------|------|
-| nvs | data/nvs | 20 KB |
-| otadata | data/ota | 8 KB |
-| app0 | app/ota_0 | **6.9 MB** |
-| coredump | data/coredump | 64 KB |
+| 名称 | 类型 | 大小 | 说明 |
+|------|------|------|------|
+| nvs | data/nvs | 20 KB | 断点续播、配置 |
+| otadata | data/ota | 8 KB | OTA 元数据 |
+| app0 | app/ota_0 | **4 MB** | 固件 |
+| model | data/spiffs | **3 MB** | 语音模型（srmodels.bin） |
+| coredump | data/coredump | 64 KB | 崩溃转储 |

@@ -17,7 +17,7 @@ BOOTLOADER := $(BUILD_DIR)/$(SKETCH).ino.bootloader.bin
 PARTITIONS := $(BUILD_DIR)/$(SKETCH).ino.partitions.bin
 FIRMWARE   := $(BUILD_DIR)/$(SKETCH).ino.bin
 
-.PHONY: all build flash clean port-detect help
+.PHONY: all build flash flash-model flash-all clean port-detect help
 
 all: build
 
@@ -28,7 +28,7 @@ build:
 	  --output-dir $(BUILD_DIR) \
 	  $(SKETCH)
 
-## flash  — flash all three binaries to the connected board
+## flash  — flash bootloader + partitions + firmware
 flash:
 	$(ESPTOOL) \
 	  --chip esp32s3 \
@@ -42,7 +42,34 @@ flash:
 	  0x8000  $(PARTITIONS) \
 	  0x10000 $(FIRMWARE)
 
-## build-flash  — compile then flash in one step
+## flash-model  — flash voice model binary (srmodels.bin) to the model partition
+flash-model:
+	$(ESPTOOL) \
+	  --chip esp32s3 \
+	  --port $(PORT) \
+	  --baud $(BAUD) \
+	  write-flash \
+	  --flash-mode keep \
+	  --flash-freq keep \
+	  --flash-size keep \
+	  0x400000 $(SKETCH)/srmodels.bin
+
+## flash-all  — flash firmware + model in one pass (first-time setup)
+flash-all:
+	$(ESPTOOL) \
+	  --chip esp32s3 \
+	  --port $(PORT) \
+	  --baud $(BAUD) \
+	  write-flash \
+	  --flash-mode keep \
+	  --flash-freq keep \
+	  --flash-size keep \
+	  0x0000   $(BOOTLOADER) \
+	  0x8000   $(PARTITIONS) \
+	  0x10000  $(FIRMWARE) \
+	  0x400000 $(SKETCH)/srmodels.bin
+
+## build-flash  — compile then flash firmware in one step
 build-flash: build flash
 
 ## clean  — remove build artefacts

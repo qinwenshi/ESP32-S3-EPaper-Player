@@ -34,6 +34,7 @@
 #include "es8311_lib.h"
 #include <vector>
 #include <string>
+#include "voice_sr.h"
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 #define EPD_MOSI   13
@@ -52,6 +53,7 @@
 #define I2S_BCLK   15
 #define I2S_LRC    38
 #define I2S_DOUT   45
+#define I2S_DIN    16   // ES8311 ADC → mic input (shared BCLK/WS with I2S1 slave)
 
 #define CODEC_SDA  47
 #define CODEC_SCL  48
@@ -827,6 +829,7 @@ static void setup_audio_callbacks()
                     uint32_t sr = atoi(m.msg + 12);
                     if (sr == 44100 || sr == 48000 || sr == 32000) {
                         codec.setSampleRate(sr);
+                        voice_sr_set_input_rate(sr);  // keep voice resampler in sync
                         Serial.printf("Codec sample rate -> %u Hz\n", sr);
                     }
                 }
@@ -1018,6 +1021,9 @@ void setup()
     Serial.println("========================");
     setup_audio_callbacks();
 
+    // ── Voice recognition (wake word "Hi,喵喵" + Chinese commands) ──
+    voice_sr_init();
+
     // ── Buttons ──
     pinMode(BOOT_BTN, INPUT_PULLUP);
     pinMode(PWR_BTN,  INPUT_PULLUP);
@@ -1081,6 +1087,52 @@ void loop()
         if (now - g_last_track_btn_ms > 500) {   // 500ms cooldown
             g_last_track_btn_ms = now;
             play_track(cur_track + 1);           // next track
+        }
+    }
+
+    // ── Voice commands (wake word: "Hi,喵喵") ──
+    {
+        int vcmd = voice_sr_get_cmd();
+        if (vcmd != VOICE_CMD_NONE) {
+            Serial.printf("[VOICE] Executing command %d\n", vcmd);
+            switch (vcmd) {
+                case VOICE_CMD_NEXT:
+                    play_track(cur_track + 1);
+                    break;
+                case VOICE_CMD_PREV:
+                    play_track(cur_track - 1);
+                    break;
+                case VOICE_CMD_PAUSE:
+                    if (is_playing) {
+                        is_playing = false;
+                        audio.pauseResume();
+                        g_prescan_allowed = true;
+                        if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            lv_label_set_text(lbl_play_icon, LV_SYMBOL_PAUSE);
+                            xSemaphoreGive(lvgl_mtx);
+                        }
+                    }
+                    break;
+                case VOICE_CMD_RESUME:
+                    if (!is_playing) {
+                        is_playing = true;
+                        audio.pauseResume();
+                        g_prescan_allowed = false;
+                        if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            lv_label_set_text(lbl_play_icon, LV_SYMBOL_PLAY);
+                            xSemaphoreGive(lvgl_mtx);
+                        }
+                    }
+                    break;
+                case VOICE_CMD_VOL_UP:
+                    codec.setVolume(min(100, (int)codec.getVolume() + 10));
+                    break;
+                case VOICE_CMD_VOL_DOWN:
+                    codec.setVolume(max(0, (int)codec.getVolume() - 10));
+                    break;
+                default:
+                    break;
+            }
         }
     }
 

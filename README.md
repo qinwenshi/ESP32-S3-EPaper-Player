@@ -61,25 +61,35 @@ MP3 文件名支持 `"艺术家 - 标题.mp3"` 格式自动解析，也支持 ID
 
 ## 编译 & 刷机
 
-### FQBN
+项目自带 `Makefile`，需要 `arduino-cli` 和 `esptool`（随 Arduino ESP32 core 安装）。
 
-```
-esp32:esp32:esp32s3:FlashSize=8M,FlashMode=qio,PartitionScheme=custom,PSRAM=opi,CPUFreq=240,DebugLevel=none,USBMode=hwcdc,CDCOnBoot=cdc
+```bash
+# 仅编译
+make build
+
+# 编译 + 刷机（一步完成）
+make build-flash
+
+# 仅刷机（使用上次编译产物）
+make flash
+
+# 指定串口（默认 /dev/cu.usbmodem21201）
+make flash PORT=/dev/cu.usbmodem12301
+
+# 查看已连接的 ESP32 串口
+make port-detect
+
+# 清理编译产物
+make clean
 ```
 
-### arduino-cli
+### 手动命令（参考）
 
 ```bash
 arduino-cli compile \
   --fqbn "esp32:esp32:esp32s3:FlashSize=8M,FlashMode=qio,PartitionScheme=custom,PSRAM=opi,CPUFreq=240,DebugLevel=none,USBMode=hwcdc,CDCOnBoot=cdc" \
   --output-dir /tmp/epaper_build \
   ESP32_EPAPER_PLAYER
-
-esptool --chip esp32s3 --port /dev/cu.usbmodem* --baud 921600 write-flash \
-  --flash-mode keep --flash-freq keep --flash-size keep \
-  0x0000 /tmp/epaper_build/ESP32_EPAPER_PLAYER.ino.bootloader.bin \
-  0x8000 /tmp/epaper_build/ESP32_EPAPER_PLAYER.ino.partitions.bin \
-  0x10000 /tmp/epaper_build/ESP32_EPAPER_PLAYER.ino.bin
 ```
 
 ---

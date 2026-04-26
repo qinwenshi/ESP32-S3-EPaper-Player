@@ -1,0 +1,12 @@
+# Arduino build artifacts
+build/
+*.elf
+*.bin
+*.map
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp

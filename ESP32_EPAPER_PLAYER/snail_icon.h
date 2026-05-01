@@ -1,37 +1,45 @@
-// Snail icon — 12×8 px, 1-bit, faces right (shell←, head→)
+// Snail icon — 24×13 px, 1-bit, faces right (shell←, head→)
 // palette[0]=white(bg), palette[1]=black(ink)
+//
+// Preview:
+//   ...................█.█..   antennae
+//   ...................█.█..   antennae
+//   ..████████........████..   shell top arc + head top
+//   .█........█.......█...█.   shell outer + head sides
+//   .█..████..█.......█...█.   inner spiral arc
+//   .█.█....█.█.......█.█.█.   inner spiral sides + eye
+//   .█.█....█.█.......█...█.   inner spiral sides
+//   .█..████..█.......█...█.   inner spiral arc + head sides
+//   .█........█.......████..   shell bot + head bottom
+//   ..████████..............   shell bottom arc
+//   █████████████████████...   body/foot
+//   █...................█...   body underside
+//   .██..██.................   feet
 #pragma once
 #include <stdint.h>
 #include <lvgl.h>
 
-#define SNAIL_W      12
-#define SNAIL_H       8
-#define SNAIL_STRIDE  2   // ceil(12/8)
-
-//  Pixel map (1=black, snail faces right):
-//   001100000101   shell-top   + antennae
-//   010010000101   shell-sides + antennae
-//   010110001110   shell+dot   + head-top
-//   010010001001   shell-sides + head-side
-//   001100001101   shell-bot   + head+eye
-//   111111111001   body strip  + head-lower
-//   100000001110   body-under  + head-bottom
-//   010100000000   feet
+#define SNAIL_W      24
+#define SNAIL_H      13
+#define SNAIL_STRIDE  3   // ceil(24/8)
 
 static const uint8_t snail_data[] = {
-    // palette[0] = white  (BGRA)
-    0xFF, 0xFF, 0xFF, 0xFF,
-    // palette[1] = black  (BGRA)
-    0x00, 0x00, 0x00, 0xFF,
-    // pixel rows (MSB-first, 2 bytes per row, 4 padding bits at end)
-    0x30, 0x50,   // row 0
-    0x48, 0x50,   // row 1
-    0x58, 0xE0,   // row 2
-    0x48, 0x90,   // row 3
-    0x30, 0xD0,   // row 4
-    0xFF, 0x90,   // row 5
-    0x80, 0xE0,   // row 6
-    0x50, 0x00,   // row 7
+    // palette[0]=white(bg)  palette[1]=black(ink)
+    0xFF,0xFF,0xFF,0xFF,  0x00,0x00,0x00,0xFF,
+    // 24-wide rows, MSB-first, 3 bytes each:
+    0x00, 0x00, 0x14,  // ...................█.█..
+    0x00, 0x00, 0x14,  // ...................█.█..
+    0x3F, 0xC0, 0x3C,  // ..████████........████..
+    0x40, 0x20, 0x22,  // .█........█.......█...█.
+    0x4F, 0x20, 0x22,  // .█..████..█.......█...█.
+    0x50, 0xA0, 0x2A,  // .█.█....█.█.......█.█.█.
+    0x50, 0xA0, 0x22,  // .█.█....█.█.......█...█.
+    0x4F, 0x20, 0x22,  // .█..████..█.......█...█.
+    0x40, 0x20, 0x3C,  // .█........█.......████..
+    0x3F, 0xC0, 0x00,  // ..████████..............
+    0xFF, 0xFF, 0xF8,  // █████████████████████...
+    0x80, 0x00, 0x08,  // █...................█...
+    0x66, 0x00, 0x00,  // .██..██.................
 };
 
 static const lv_image_dsc_t snail_dsc = {

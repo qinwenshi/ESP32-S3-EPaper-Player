@@ -90,9 +90,8 @@
 #define SEP2_Y     (LYR2_Y + 13)              // 163
 #define CTRL_Y     (SEP2_Y + 2)               // 165
 
-// Snail-lane geometry (used when no lyrics)
-#define SNAIL_LANE_Y  (SEP1_Y + (SEP2_Y - SEP1_Y) / 2 + 2)   // 142 — ground line
-#define SNAIL_OBJ_Y   (SNAIL_LANE_Y - SNAIL_H)                // 134 — snail sits on lane
+// Snail sits centred on the progress bar
+#define SNAIL_OBJ_Y   (PROG_Y + PROG_H/2 - SNAIL_H/2)   // ~108
 
 // ── Cover-art buffer (I1 = 1-bit indexed, palette + bitmap) ──────────────────
 #define COVER_W     ART_SIZE
@@ -135,8 +134,7 @@ static lv_obj_t *lbl_lyr1;  // next
 static lv_obj_t *lbl_lyr2;  // next+1
 static lv_obj_t *lbl_ctrl;
 static lv_obj_t *lbl_play_icon;  // ▶ / ⏸ state icon
-static lv_obj_t *img_snail;      // snail icon (shown when no lyrics)
-static lv_obj_t *obj_snail_lane; // thin ground line under snail
+static lv_obj_t *img_snail;      // snail icon crawls on progress bar
 
 // Font forward declarations (defined in font_cubic11_14.c / font_cubic11_11.c)
 LV_FONT_DECLARE(font_cubic11_14)
@@ -322,21 +320,10 @@ static void build_screen()
     lv_label_set_long_mode(lbl_lyr2, LV_LABEL_LONG_DOT);
     lv_label_set_text(lbl_lyr2, "");
 
-    // ── Snail lane (ground line, shown when no lyrics) ──
-    obj_snail_lane = lv_obj_create(scr);
-    lv_obj_remove_style_all(obj_snail_lane);
-    lv_obj_set_size(obj_snail_lane, EPD_W - 4, 1);
-    lv_obj_set_pos(obj_snail_lane, 2, SNAIL_LANE_Y);
-    lv_obj_set_style_bg_color(obj_snail_lane, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(obj_snail_lane, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(obj_snail_lane, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(obj_snail_lane, LV_OBJ_FLAG_HIDDEN);
-
-    // ── Snail icon (shown when no lyrics, x tracks progress) ──
+    // ── Snail icon (crawls on progress bar, always visible) ──
     img_snail = lv_image_create(scr);
     lv_image_set_src(img_snail, &snail_dsc);
     lv_obj_set_pos(img_snail, 2, SNAIL_OBJ_Y);
-    lv_obj_add_flag(img_snail, LV_OBJ_FLAG_HIDDEN);
 
     // ── Separator 2 ──
     lv_obj_t *sep2 = lv_obj_create(scr);
@@ -383,15 +370,8 @@ static void refresh_ui()
     int32_t val = (tot > 0) ? (int32_t)(cur * 1000 / tot) : 0;
     lv_bar_set_value(bar_prog, val, LV_ANIM_OFF);
 
-    // Snail crawl: shown when no lyrics, hidden when lyrics present
-    bool has_lyrics = (g_lyr[0][0] != '\0');
-    if (has_lyrics) {
-        lv_obj_add_flag(img_snail,      LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(obj_snail_lane, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_clear_flag(img_snail,      LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(obj_snail_lane, LV_OBJ_FLAG_HIDDEN);
-        // x travels from 2 to (EPD_W - 2 - SNAIL_W)
+    // Snail crawls on progress bar
+    {
         int32_t sx = 2 + (int32_t)(val * (EPD_W - 4 - SNAIL_W) / 1000);
         lv_obj_set_x(img_snail, sx);
     }

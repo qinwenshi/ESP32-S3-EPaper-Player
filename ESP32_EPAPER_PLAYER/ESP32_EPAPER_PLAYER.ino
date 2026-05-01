@@ -65,6 +65,8 @@
 #define BOOT_BTN    0
 #define PWR_BTN    18
 
+#define SLEEP_TIMEOUT_MS  (2UL * 60UL * 1000UL)  // 2 min pause → deep sleep
+
 // ── Display geometry ─────────────────────────────────────────────────────────
 #define EPD_W 200
 #define EPD_H 200
@@ -167,6 +169,9 @@ static bool     g_silent_flush  = false;  // when true, populate buffer without 
 
 // ── EOF auto-advance debounce (file-scope so play_track can reset it) ─────────
 static uint32_t g_eof_debounce = 0;
+
+// ── Deep sleep: track when playback paused ───────────────────────────────────
+static uint32_t g_paused_since_ms = 0;  // 0 = playing (not counting)
 
 // ── Cover decode task (Core 0) ────────────────────────────────────────────────
 struct CoverDecodeReq {
@@ -1086,6 +1091,36 @@ void setup()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Deep sleep helper — call when paused too long
+// ─────────────────────────────────────────────────────────────────────────────
+static void enter_deep_sleep()
+{
+    Serial.println("[SLEEP] Paused too long — entering deep sleep");
+    Serial.flush();
+
+    // Force-save current position to NVS
+    prefs.putInt("track", cur_track);
+    prefs.putUInt("pos",   audio.getAudioCurrentTime());
+
+    // Stop audio cleanly
+    audio.stopSong();
+    delay(50);
+
+    // Power down amplifier and analog rail
+    digitalWrite(PA_PIN,    LOW);   // amp off
+    digitalWrite(AUDIO_PWR, HIGH);  // analog rail off (active LOW → HIGH = off)
+
+    // Save EPD frame so next boot can restore it without full refresh
+    epd_save_frame();
+
+    // Wake on BOOT button press (GPIO0, active LOW)
+    esp_sleep_enable_ext1_wakeup(1ULL << BOOT_BTN, ESP_EXT1_WAKEUP_ANY_LOW);
+
+    esp_deep_sleep_start();
+    // Never returns — MCU resets on wakeup and runs setup() again
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // loop()
 // ─────────────────────────────────────────────────────────────────────────────
 static uint32_t last_ui_tick   = 0;
@@ -1285,6 +1320,19 @@ void loop()
         if (xSemaphoreTake(lvgl_mtx, 0) == pdTRUE) {
             refresh_ui();
             xSemaphoreGive(lvgl_mtx);
+        }
+    }
+
+    // ── Deep sleep: enter after SLEEP_TIMEOUT_MS of continuous pause ──
+    {
+        static bool s_was_playing = true;  // assume playing at start
+        if (is_playing != s_was_playing) {
+            s_was_playing = is_playing;
+            g_paused_since_ms = is_playing ? 0 : millis();
+        }
+        if (!is_playing && g_paused_since_ms != 0 &&
+            millis() - g_paused_since_ms > SLEEP_TIMEOUT_MS) {
+            enter_deep_sleep();
         }
     }
 

@@ -422,13 +422,21 @@ void voice_sr_init(void)
         return;
     }
 
+    // mn5q8_en phoneme constraints: avoid dense consonant clusters (/kst/ in "next",
+    // onset clusters like /pl/ in "play"). Use 2-3 syllable natural phrases.
     esp_mn_commands_alloc(s_multinet, s_mn_data);
-    esp_mn_commands_add(VOICE_CMD_NEXT,     "next song");
+    esp_mn_commands_add(VOICE_CMD_NEXT,     "change song");    // "next" /kst/ fails
+    esp_mn_commands_add(VOICE_CMD_NEXT,     "skip song");
     esp_mn_commands_add(VOICE_CMD_PREV,     "previous song");
+    esp_mn_commands_add(VOICE_CMD_PREV,     "go to previous");
     esp_mn_commands_add(VOICE_CMD_PAUSE,    "pause");
-    esp_mn_commands_add(VOICE_CMD_RESUME,   "play");
+    esp_mn_commands_add(VOICE_CMD_PAUSE,    "stop music");
+    esp_mn_commands_add(VOICE_CMD_RESUME,   "start music");    // "play" onset /pl/ fails
+    esp_mn_commands_add(VOICE_CMD_RESUME,   "resume music");
     esp_mn_commands_add(VOICE_CMD_VOL_UP,   "volume up");
+    esp_mn_commands_add(VOICE_CMD_VOL_UP,   "turn up");
     esp_mn_commands_add(VOICE_CMD_VOL_DOWN, "volume down");
+    esp_mn_commands_add(VOICE_CMD_VOL_DOWN, "turn down");
     esp_mn_error_t *mn_err = esp_mn_commands_update();
     if (mn_err && mn_err->num > 0) {
         Serial.printf("[VOICE] WARNING: %d command(s) could not be added:\n", mn_err->num);

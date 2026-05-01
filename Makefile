@@ -4,7 +4,7 @@
 
 SKETCH     := ESP32_EPAPER_PLAYER
 BUILD_DIR  := /tmp/epaper_build
-PORT       ?= /dev/cu.usbmodem21201
+PORT       ?= $(shell ls /dev/cu.usbmodem* /dev/cu.SLAB* /dev/cu.wchusbserial* 2>/dev/null | grep -v usbserial-2110 | head -1)
 BAUD       ?= 921600
 
 FQBN := esp32:esp32:esp32s3:FlashSize=8M,FlashMode=qio,PartitionScheme=custom,\

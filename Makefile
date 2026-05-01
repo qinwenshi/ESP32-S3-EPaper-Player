@@ -86,7 +86,7 @@ port-detect:
 
 ## monitor  — open serial monitor at 921600 baud
 monitor:
-	@python3 -c "import serial, time, sys; s=serial.Serial('$(PORT)', 921600, timeout=1); [print(l.decode(errors='replace').strip()) or True for l in iter(lambda: s.readline(), b'') if l.strip()]" 2>/dev/null || echo "Install pyserial: pip3 install pyserial"
+	@python3 -c "import serial, time, sys; s=serial.Serial('$(PORT       ?= /dev/cu.usbmodem21201
 
 ## help  — list available targets
 help:

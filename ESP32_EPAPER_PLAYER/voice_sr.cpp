@@ -44,6 +44,14 @@ static volatile uint32_t g_in_rate      = 44100;
 static volatile bool     s_listen_req   = false;  // set by voice_sr_start_listen()
 static volatile bool     s_mn_active    = false;  // true during command window
 
+// I2S1 frame-phase offset (0 or 2): which int16 slot within each 4-int16 group
+// contains the valid audio from the ES8311 ADC.
+// With a 32-bit I2S0 master and 16-bit I2S1 slave, there's a phase ambiguity:
+// I2S1 reads 2 sub-frames per I2S0 WS cycle. On each boot, the valid frame may
+// appear at stereo[i*4] (offset=0) or stereo[i*4+2] (offset=2).
+// Auto-detected below by comparing energy of the two slots during music playback.
+static int               s_frame_offset = 0;
+
 static i2s_chan_handle_t         s_i2s1_rx   = nullptr;
 static esp_afe_sr_data_t        *s_afe_data  = nullptr;
 static const esp_afe_sr_iface_t *s_afe       = nullptr;
@@ -159,10 +167,25 @@ static void feed_task(void *arg)
         // 32-bit RIGHT slot which is zero for mono ES8311).
         int actual_samples = frames_read / 2;
 
-        // Extract valid audio: take stereo[i*4] (LEFT channel of every 2nd frame)
-        // Apply 8x software gain to boost mic signal for WakeNet (clipped to int16 range)
+        // ── Auto-detect I2S frame phase (0 or 2) ─────────────────────────────
+        // Compare energy of stereo[i*4] vs stereo[i*4+2]. The slot with 10×
+        // more energy is the valid audio slot. Only update when one is dominant
+        // (hysteresis: keep previous offset when both are quiet, e.g. during mute).
+        {
+            int64_t e0 = 0, e2 = 0;
+            int n = (actual_samples < 32) ? actual_samples : 32;
+            for (int i = 0; i < n; i++) {
+                e0 += (int64_t)stereo[i*4]   * stereo[i*4];
+                e2 += (int64_t)stereo[i*4+2] * stereo[i*4+2];
+            }
+            if      (e0 > e2 * 10) s_frame_offset = 0;
+            else if (e2 > e0 * 10) s_frame_offset = 2;
+            // else: ambiguous (both quiet) — keep previous offset
+        }
+
+        // Extract valid audio using detected offset; apply 8x gain
         for (int i = 0; i < actual_samples; i++) {
-            int v = (int)stereo[i * 4] * 8;
+            int v = (int)stereo[i * 4 + s_frame_offset] * 8;
             mono[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 
@@ -185,10 +208,17 @@ static void feed_task(void *arg)
                 int64_t s2 = 0, f2 = 0;
                 for (int i = 0; i < actual_samples; i++) s2 += (int64_t)mono[i] * mono[i];
                 for (int i = 0; i < afe_chunk;      i++) f2 += (int64_t)resampled[i] * resampled[i];
-                Serial.printf("[VOICE] MicRMS=%d FeedRMS=%d rate=%u\n",
+                Serial.printf("[VOICE] MicRMS=%d FeedRMS=%d rate=%u frames_read=%d offset=%d\n",
                     (int)sqrtf((float)(s2 / actual_samples)),
                     (int)sqrtf((float)(f2 / afe_chunk)),
-                    in_rate);
+                    in_rate, frames_read, s_frame_offset);
+                // Raw I2S frame dump: check interleaving pattern
+                // [i*4]=LEFT valid, [i*4+2]=RIGHT(zero for mono)
+                if (frames_read >= 8) {
+                    Serial.printf("[VOICE] RAW[0..7]: %d %d %d %d | %d %d %d %d\n",
+                        stereo[0], stereo[1], stereo[2], stereo[3],
+                        stereo[4], stereo[5], stereo[6], stereo[7]);
+                }
             }
         }
 
@@ -260,6 +290,14 @@ static void detect_task(void *arg)
             }
         } else {
             esp_mn_state_t mn_state = s_multinet->detect(s_mn_data, result->data);
+            // Fast DataRMS during command window so we can see speech effect
+            if (result->data && result->data_size > 0) {
+                int n = result->data_size / sizeof(int16_t);
+                int64_t d2 = 0;
+                for (int i = 0; i < n; i++) d2 += (int64_t)result->data[i] * result->data[i];
+                Serial.printf("[VOICE] CMD DataRMS=%d vad=%d\n",
+                    (int)sqrtf((float)(d2/n)), result->vad_state);
+            }
             if (mn_state == ESP_MN_STATE_DETECTED) {
                 esp_mn_results_t *res = s_multinet->get_results(s_mn_data);
                 if (res && res->num > 0) {

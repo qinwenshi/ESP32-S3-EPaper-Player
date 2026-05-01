@@ -150,8 +150,9 @@ static uint32_t g_last_track_btn_ms    = 0;     // debounce for track buttons
 // ── Voice command mute management ─────────────────────────────────────────────
 // When long-pressing BOOT, we mute the speaker and trigger manual listen mode.
 // The speaker is restored once voice_sr_is_listening() returns false.
-static bool     g_voice_muted   = false;
-static uint8_t  g_saved_vol     = 70;
+static bool     g_voice_muted      = false;
+static uint8_t  g_saved_vol        = 70;
+static bool     g_voice_was_paused = false;  // music was paused when voice activated
 
 // ── NVS playback state ────────────────────────────────────────────────────────
 static Preferences  prefs;
@@ -1086,11 +1087,21 @@ void loop()
                 if (!g_voice_muted) {
                     g_saved_vol   = codec.getVolume();
                     g_voice_muted = true;
-                    codec.setVolume(0);
-                    delay(150);   // let speaker tail decay
+                    codec.dacMute(true);   // cut DAC→ADC coupling at digital stage
+
+                    // I2S1 (mic) is a slave — it needs I2S0's BCLK/WS to work.
+                    // If playback is paused, I2S0 clock is dead → mic reads zeros.
+                    // Temporarily resume at 0 volume to keep the clock alive.
+                    g_voice_was_paused = !is_playing;
+                    if (!is_playing) {
+                        is_playing = true;
+                        audio.pauseResume();
+                        Serial.println("[VOICE] Resumed I2S clock for mic");
+                    }
+                    delay(300);   // let DAC mute settle + allow frame-phase detection
                 }
                 voice_sr_start_listen();
-                Serial.println("[VOICE] Long press — speak command now (volume muted)");
+                Serial.println("[VOICE] Long press — speak command now");
             } else if (held > 50) {
                 // Short press → play/pause
                 is_playing = !is_playing;
@@ -1107,9 +1118,20 @@ void loop()
 
     // ── Restore volume after voice command window closes ──
     if (g_voice_muted && !voice_sr_is_listening()) {
-        codec.setVolume(g_saved_vol);
+        codec.dacMute(false);          // re-enable DAC
+        codec.setVolume(g_saved_vol);  // restore to pre-voice volume
         g_voice_muted = false;
-        Serial.println("[VOICE] Volume restored");
+        // Re-pause if music was paused before voice activation
+        if (g_voice_was_paused) {
+            audio.pauseResume();
+            is_playing = false;
+            g_voice_was_paused = false;
+            if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+                lv_label_set_text(lbl_play_icon, LV_SYMBOL_PAUSE);
+                xSemaphoreGive(lvgl_mtx);
+            }
+        }
+        Serial.println("[VOICE] DAC restored");
     }
 
     // ── Button: PWR ──

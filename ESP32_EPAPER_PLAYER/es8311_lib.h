@@ -34,6 +34,7 @@ public:
     bool begin(int32_t sda, int32_t scl, uint32_t frequency);
     bool setVolume(uint8_t volume);
     uint8_t getVolume();
+    bool dacMute(bool mute);   // digital mute via reg0x31 — cuts internal DAC→ADC coupling
     bool setSampleRate(uint32_t sample_rate);
     bool setBitsPerSample(uint8_t bps);
     bool enableMicrophone(bool enable);

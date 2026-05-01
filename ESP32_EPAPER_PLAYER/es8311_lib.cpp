@@ -250,6 +250,16 @@ bool ES8311::setVolume(uint8_t volume){ // 0...100
     return WriteReg(0x32, reg32);
 }
 
+bool ES8311::dacMute(bool mute) {
+    // reg0x31 bits[6:5]: 0b00 = unmuted, 0b11 = DAC digital mute
+    // Muting here cuts the I2S data path inside the DAC DSP, which eliminates
+    // internal DAC→ADC coupling (music heard by mic even with speaker at volume 0).
+    uint8_t reg = ReadReg(0x31);
+    if (mute) reg |=  0x60;   // set bits[6:5]
+    else      reg &= ~0x60;   // clear bits[6:5]
+    return WriteReg(0x31, reg);
+}
+
 uint8_t ES8311::getVolume(){
     uint8_t reg32 = ReadReg(0x32);
     uint8_t volume;

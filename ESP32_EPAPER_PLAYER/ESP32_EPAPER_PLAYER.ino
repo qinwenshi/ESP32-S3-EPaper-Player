@@ -147,6 +147,12 @@ static bool     g_meta_needs_save = false;
 static bool     g_full_refresh_pending = false; // deferred EPD full refresh
 static uint32_t g_last_track_btn_ms    = 0;     // debounce for track buttons
 
+// ── Voice command mute management ─────────────────────────────────────────────
+// When long-pressing BOOT, we mute the speaker and trigger manual listen mode.
+// The speaker is restored once voice_sr_is_listening() returns false.
+static bool     g_voice_muted   = false;
+static uint8_t  g_saved_vol     = 70;
+
 // ── NVS playback state ────────────────────────────────────────────────────────
 static Preferences  prefs;
 static uint32_t     g_restore_pos_sec = 0;   // position to seek to; cleared after seek
@@ -878,18 +884,25 @@ static volatile bool     g_boot_flag   = false;
 static volatile bool     g_pwr_flag    = false;
 static volatile uint32_t g_boot_down   = 0;   // time of press
 static volatile uint32_t g_boot_held   = 0;   // duration (set on release)
+static volatile uint32_t g_pwr_down    = 0;
+static volatile uint32_t g_pwr_held    = 0;
 
 void IRAM_ATTR isr_boot() {
     if (digitalRead(BOOT_BTN) == LOW) {
-        // Falling edge: button pressed
         g_boot_down = millis();
     } else {
-        // Rising edge: button released
         g_boot_held = millis() - g_boot_down;
         g_boot_flag = true;
     }
 }
-void IRAM_ATTR isr_pwr() { g_pwr_flag = true; }
+void IRAM_ATTR isr_pwr() {
+    if (digitalRead(PWR_BTN) == LOW) {
+        g_pwr_down = millis();
+    } else {
+        g_pwr_held = millis() - g_pwr_down;
+        g_pwr_flag = true;
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // setup()
@@ -1031,7 +1044,7 @@ void setup()
     pinMode(BOOT_BTN, INPUT_PULLUP);
     pinMode(PWR_BTN,  INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(BOOT_BTN), isr_boot, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(PWR_BTN),  isr_pwr,  FALLING);
+    attachInterrupt(digitalPinToInterrupt(PWR_BTN),  isr_pwr,  CHANGE);
 
     // ── Auto-play: start saved track (display already rendered above) ──
     if (!tracks.empty()) {
@@ -1066,14 +1079,23 @@ void loop()
         uint32_t held = g_boot_held;
         uint32_t now  = millis();
         if (now - g_last_track_btn_ms > 500) {   // 500ms cooldown
-            if (held > 800) {
+            if (held > 1200) {
+                // Long press (>1.2s) → voice command mode
+                // Mute speaker so mic only hears user's voice (no music echo)
                 g_last_track_btn_ms = now;
-                play_track(cur_track - 1);       // long press → previous
-            } else {
+                if (!g_voice_muted) {
+                    g_saved_vol   = codec.getVolume();
+                    g_voice_muted = true;
+                    codec.setVolume(0);
+                    delay(150);   // let speaker tail decay
+                }
+                voice_sr_start_listen();
+                Serial.println("[VOICE] Long press — speak command now (volume muted)");
+            } else if (held > 50) {
+                // Short press → play/pause
                 is_playing = !is_playing;
                 audio.pauseResume();
-                g_prescan_allowed = !is_playing;  // start prescan while paused
-                // Update play icon immediately (no need to wait for 1-s tick)
+                g_prescan_allowed = !is_playing;
                 if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
                     lv_label_set_text(lbl_play_icon,
                         is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
@@ -1083,13 +1105,24 @@ void loop()
         }
     }
 
+    // ── Restore volume after voice command window closes ──
+    if (g_voice_muted && !voice_sr_is_listening()) {
+        codec.setVolume(g_saved_vol);
+        g_voice_muted = false;
+        Serial.println("[VOICE] Volume restored");
+    }
+
     // ── Button: PWR ──
     if (g_pwr_flag) {
         g_pwr_flag = false;
         uint32_t now = millis();
-        if (now - g_last_track_btn_ms > 500) {   // 500ms cooldown
+        if (now - g_last_track_btn_ms > 500) {
             g_last_track_btn_ms = now;
-            play_track(cur_track + 1);           // next track
+            if (g_pwr_held > 800) {
+                play_track(cur_track - 1);   // long press → previous track
+            } else {
+                play_track(cur_track + 1);   // short press → next track
+            }
         }
     }
 

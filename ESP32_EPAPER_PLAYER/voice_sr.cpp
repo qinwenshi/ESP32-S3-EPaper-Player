@@ -39,8 +39,10 @@ extern "C" {
 #define VOICE_SR_HZ   16000   // AFE requires 16 kHz input
 
 // ── Module state ─────────────────────────────────────────────────────────────
-static volatile int      g_voice_cmd = VOICE_CMD_NONE;
-static volatile uint32_t g_in_rate   = 44100;   // updated by voice_sr_set_input_rate()
+static volatile int      g_voice_cmd    = VOICE_CMD_NONE;
+static volatile uint32_t g_in_rate      = 44100;
+static volatile bool     s_listen_req   = false;  // set by voice_sr_start_listen()
+static volatile bool     s_mn_active    = false;  // true during command window
 
 static i2s_chan_handle_t         s_i2s1_rx   = nullptr;
 static esp_afe_sr_data_t        *s_afe_data  = nullptr;
@@ -158,8 +160,11 @@ static void feed_task(void *arg)
         int actual_samples = frames_read / 2;
 
         // Extract valid audio: take stereo[i*4] (LEFT channel of every 2nd frame)
-        for (int i = 0; i < actual_samples; i++)
-            mono[i] = stereo[i * 4];
+        // Apply 8x software gain to boost mic signal for WakeNet (clipped to int16 range)
+        for (int i = 0; i < actual_samples; i++) {
+            int v = (int)stereo[i * 4] * 8;
+            mono[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+        }
 
         // Resample actual_samples @ in_rate → afe_chunk @ 16 kHz
         int out_cnt = resample_to_16k(mono, actual_samples, in_rate, resampled, afe_chunk);
@@ -218,7 +223,14 @@ static void detect_task(void *arg)
             uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
             if (now - last_diag > 2000) {
                 last_diag = now;
-                Serial.printf("[VOICE] vol=%.1fdB rbuf_free=%.2f vad=%d wakeup=%d\n",
+                // Compute RMS of the data that WakeNet actually receives
+                int dsize = result->data_size / sizeof(int16_t);
+                int64_t d2 = 0;
+                if (result->data && dsize > 0)
+                    for (int i = 0; i < dsize; i++) d2 += (int64_t)result->data[i] * result->data[i];
+                int drms = dsize > 0 ? (int)sqrtf((float)(d2 / dsize)) : 0;
+                Serial.printf("[VOICE] DataRMS=%d(n=%d) vol=%.1fdB rbuf=%.2f vad=%d wakeup=%d\n",
+                    drms, dsize,
                     result->data_volume,
                     result->ringbuff_free_pct,
                     result->vad_state,
@@ -227,14 +239,24 @@ static void detect_task(void *arg)
         }
 
         if (!mn_active) {
-            if (result->wakeup_state != WAKENET_NO_DETECT)
+            // Enter command mode on wake word OR manual trigger (voice_sr_start_listen)
+            bool manual = s_listen_req;
+            if (manual) s_listen_req = false;
+
+            if (result->wakeup_state != WAKENET_NO_DETECT && !manual)
                 Serial.printf("[VOICE] wakeup_state=%d\n", result->wakeup_state);
 
-            if (result->wakeup_state == WAKENET_DETECTED ||
-                result->wakeup_state == WAKENET_CHANNEL_VERIFIED) {
-                Serial.println("[VOICE] *** Wake word detected: Hi ESP! ***");
+            bool wake_triggered = (result->wakeup_state == WAKENET_DETECTED ||
+                                   result->wakeup_state == WAKENET_CHANNEL_VERIFIED);
+
+            if (manual || wake_triggered) {
+                if (manual)
+                    Serial.println("[VOICE] *** Manual listen activated — speak command ***");
+                else
+                    Serial.println("[VOICE] *** Wake word detected: Hi ESP! ***");
                 s_multinet->clean(s_mn_data);
-                mn_active = true;
+                mn_active  = true;
+                s_mn_active = true;
             }
         } else {
             esp_mn_state_t mn_state = s_multinet->detect(s_mn_data, result->data);
@@ -244,10 +266,12 @@ static void detect_task(void *arg)
                     Serial.printf("[VOICE] Command %d detected\n", res->command_id[0]);
                     g_voice_cmd = res->command_id[0];
                 }
-                mn_active = false;
+                mn_active  = false;
+                s_mn_active = false;
             } else if (mn_state == ESP_MN_STATE_TIMEOUT) {
                 Serial.println("[VOICE] Command timeout");
-                mn_active = false;
+                mn_active  = false;
+                s_mn_active = false;
             }
         }
     }
@@ -258,6 +282,17 @@ static void detect_task(void *arg)
 void voice_sr_set_input_rate(uint32_t hz)
 {
     if (hz > 0) g_in_rate = hz;
+}
+
+void voice_sr_start_listen(void)
+{
+    s_listen_req = true;
+    s_mn_active  = true;   // mark as active immediately so caller can mute before first chunk
+}
+
+bool voice_sr_is_listening(void)
+{
+    return s_mn_active;
 }
 
 int voice_sr_get_cmd(void)

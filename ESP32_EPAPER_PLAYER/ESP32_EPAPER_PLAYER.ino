@@ -1000,6 +1000,7 @@ void setup()
     lv_display_set_buffers(disp, lvgl_buf, nullptr, EPD_W * EPD_H * 2,
                            LV_DISPLAY_RENDER_MODE_FULL);
     lv_display_set_flush_cb(disp, epd_flush_cb);
+    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);  // rotate CW 90°
 
     // ── Build UI ──
     build_screen();

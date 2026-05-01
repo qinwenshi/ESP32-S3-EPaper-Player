@@ -183,9 +183,11 @@ static void feed_task(void *arg)
             // else: ambiguous (both quiet) — keep previous offset
         }
 
-        // Extract valid audio using detected offset; apply 8x gain
+        // Extract valid audio using detected offset.
+        // 4x software gain: raw speech RMS ~800, peak ~2500, ×4 = ~10000 — safe within int16.
+        // 1x was too low for MultiNet; 8x caused clipping (peak × 8 >> 32767).
         for (int i = 0; i < actual_samples; i++) {
-            int v = (int)stereo[i * 4 + s_frame_offset] * 8;
+            int v = (int)stereo[i * 4 + s_frame_offset] * 4;
             mono[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 

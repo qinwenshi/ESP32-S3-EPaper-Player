@@ -1,10 +1,15 @@
 // voice_sr.cpp — Wake word + speech command recognition using ESP-SR
-// Wake word : "你好小智"  (wn9_nihaoxiaozhi — real human-speech trained)
-// Commands  : Chinese phrases (mn5q8_cn)
+// Wake word : "Hi ESP"  (wn9_hiesp — official Espressif model)
+// Commands  : English phrases (mn5q8_en)
 // Mic path  : ES8311 ADC → I2S1 slave (DIN=GPIO16, BCLK=GPIO15, WS=GPIO38)
 //             software-resample audio-rate → 16 kHz for AFE
 //
 // IMPORTANT: voice partition "model" must be flashed at 0x400000 with srmodels.bin.
+// For Hi ESP: use the official Arduino esp32s3 srmodels.bin (contains wn9_hiesp + mn5q8_en).
+//
+// I2S NOTE: I2S0 (audio) uses 32-bit slots. I2S1 slave with 16-bit slot_bit_width
+// reads 2 frames per WS cycle — only even frames are valid. We read 2x frames and
+// take every-other (stereo[i*4]) to reconstruct clean 44100 Hz audio.
 
 #include "Arduino.h"
 #include "freertos/FreeRTOS.h"
@@ -227,7 +232,7 @@ static void detect_task(void *arg)
 
             if (result->wakeup_state == WAKENET_DETECTED ||
                 result->wakeup_state == WAKENET_CHANNEL_VERIFIED) {
-                Serial.println("[VOICE] *** Wake word detected: 你好小智! ***");
+                Serial.println("[VOICE] *** Wake word detected: Hi ESP! ***");
                 s_multinet->clean(s_mn_data);
                 mn_active = true;
             }
@@ -279,15 +284,14 @@ void voice_sr_init(void)
     }
 
     // 2. Find WakeNet and MultiNet model names
-    // 2. Find WakeNet and MultiNet model names
-    char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "nihaoxiaozhi");
-    char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
+    char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "hiesp");
+    char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
     if (!wn_name) {
-        Serial.println("[VOICE] ERROR: wn9_nihaoxiaozhi not found in models");
+        Serial.println("[VOICE] ERROR: wn9_hiesp not found in models");
         return;
     }
     if (!mn_name) {
-        Serial.println("[VOICE] ERROR: mn5q8_cn not found in models");
+        Serial.println("[VOICE] ERROR: mn5q8_en not found in models");
         return;
     }
     Serial.printf("[VOICE] WakeNet: %s\n", wn_name);
@@ -301,7 +305,7 @@ void voice_sr_init(void)
         Serial.println("[VOICE] ERROR: afe_config_init failed");
         return;
     }
-    afe_cfg->wakenet_model_name = wn_name;       // explicitly use wn9_nihaoxiaozhi
+    afe_cfg->wakenet_model_name = wn_name;       // explicitly use wn9_hiesp
     afe_cfg->memory_alloc_mode  = AFE_MEMORY_ALLOC_MORE_PSRAM;
     afe_cfg->ns_init            = false;          // keep NS disabled: causes OOM/reboot with LOW_COST mode
     afe_cfg->afe_perferred_core     = 1;          // AFE internal tasks on Core 1
@@ -346,12 +350,12 @@ void voice_sr_init(void)
     }
 
     esp_mn_commands_alloc(s_multinet, s_mn_data);
-    esp_mn_commands_add(VOICE_CMD_NEXT,     "xia yi shou");
-    esp_mn_commands_add(VOICE_CMD_PREV,     "shang yi shou");
-    esp_mn_commands_add(VOICE_CMD_PAUSE,    "zan ting");
-    esp_mn_commands_add(VOICE_CMD_RESUME,   "ji xu bo fang");
-    esp_mn_commands_add(VOICE_CMD_VOL_UP,   "sheng yin da yi dian");
-    esp_mn_commands_add(VOICE_CMD_VOL_DOWN, "sheng yin xiao yi dian");
+    esp_mn_commands_add(VOICE_CMD_NEXT,     "next song");
+    esp_mn_commands_add(VOICE_CMD_PREV,     "previous song");
+    esp_mn_commands_add(VOICE_CMD_PAUSE,    "pause");
+    esp_mn_commands_add(VOICE_CMD_RESUME,   "play");
+    esp_mn_commands_add(VOICE_CMD_VOL_UP,   "volume up");
+    esp_mn_commands_add(VOICE_CMD_VOL_DOWN, "volume down");
     esp_mn_error_t *mn_err = esp_mn_commands_update();
     if (mn_err && mn_err->num > 0) {
         Serial.printf("[VOICE] WARNING: %d command(s) could not be added:\n", mn_err->num);
@@ -374,5 +378,5 @@ void voice_sr_init(void)
     vTaskDelay(pdMS_TO_TICKS(10));
     xTaskCreatePinnedToCore(detect_task, "voice_detect", 8192, nullptr, 5, nullptr, 1);
 
-    Serial.println("[VOICE] Voice recognition started — say '你好小智' to activate");
+    Serial.println("[VOICE] Voice recognition started — say 'Hi ESP' to activate");
 }

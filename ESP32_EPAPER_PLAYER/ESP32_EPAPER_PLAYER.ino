@@ -1093,7 +1093,7 @@ void loop()
         }
     }
 
-    // ── Voice commands (wake word: "Hi,喵喵") ──
+    // ── Voice commands (wake word: "你好小智") ──
     {
         int vcmd = voice_sr_get_cmd();
         if (vcmd != VOICE_CMD_NONE) {

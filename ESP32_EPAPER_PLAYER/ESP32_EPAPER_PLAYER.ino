@@ -498,7 +498,8 @@ static void scan_tracks()
         File f;
         while ((f = root.openNextFile())) {
             String nm = String(f.name());
-            if (!f.isDirectory() && (nm.endsWith(".mp3") || nm.endsWith(".MP3")))
+            if (!f.isDirectory() && (nm.endsWith(".mp3") || nm.endsWith(".MP3"))
+                    && !nm.startsWith("._"))  // skip macOS resource fork files
                 tracks.push_back(String(dir) + (String(dir)=="/" ? "" : "/") + nm);
             f.close();
         }
@@ -1015,6 +1016,8 @@ void setup()
     }
     codec.setSampleRate(44100);  // override default 48k; reconfigures for 44.1kHz MCLK
     codec.setVolume(70);         // ~70% (reg32=0xB2, near 0dB) — adjust as needed
+    codec.enableMicrophone(true);  // enable ES8311 ADC path for voice recognition
+    codec.setMicrophoneGain(7);    // max PGA gain (0-7)
     // Print register dump to confirm codec state
     Serial.println("=== ES8311 registers ===");
     codec.read_all();

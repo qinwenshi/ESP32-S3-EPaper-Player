@@ -1,5 +1,5 @@
 // voice_sr.cpp — Wake word + speech command recognition using ESP-SR
-// Wake word : "Hi,喵喵"  (wn9_himiaomiao_tts)
+// Wake word : "你好小智"  (wn9_nihaoxiaozhi — real human-speech trained)
 // Commands  : Chinese phrases (mn5q8_cn)
 // Mic path  : ES8311 ADC → I2S1 slave (DIN=GPIO16, BCLK=GPIO15, WS=GPIO38)
 //             software-resample audio-rate → 16 kHz for AFE
@@ -117,6 +117,7 @@ static void voice_task(void *arg)
     Serial.printf("[VOICE] Task started — AFE chunk=%d samples, channels=%d\n", afe_chunk, afe_ch);
 
     bool mn_active = false;
+    uint32_t last_rms_log = 0;  // periodic mic level diagnostic
 
     for (;;) {
         uint32_t in_rate = g_in_rate;
@@ -134,9 +135,9 @@ static void voice_task(void *arg)
 
         int frames_read = (int)(bytes_read / 4);
 
-        // Stereo → mono (average L+R)
+        // Stereo → mono: ES8311 is mono, ADC on LEFT channel, right channel is 0
         for (int i = 0; i < frames_read; i++) {
-            mono[i] = (int16_t)(((int)stereo[i * 2] + (int)stereo[i * 2 + 1]) / 2);
+            mono[i] = stereo[i * 2];  // left channel only (right = 0 from ES8311)
         }
 
         // Resample mono to 16 kHz
@@ -145,16 +146,47 @@ static void voice_task(void *arg)
             memset(feed + out_cnt, 0, (afe_chunk - out_cnt) * sizeof(int16_t));
         }
 
-        // Feed AFE
-        s_afe->feed(s_afe_data, feed);
+        // Periodic diagnostics: raw mic + resampled feed levels (every 5 s)
+        {
+            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (now_ms - last_rms_log > 5000) {
+                last_rms_log = now_ms;
+                int64_t sum2 = 0;
+                for (int i = 0; i < frames_read; i++) sum2 += (int64_t)mono[i] * mono[i];
+                int rms = (int)sqrtf((float)(sum2 / frames_read));
+                int64_t fsum2 = 0;
+                for (int i = 0; i < afe_chunk; i++) fsum2 += (int64_t)feed[i] * feed[i];
+                int frms = (int)sqrtf((float)(fsum2 / afe_chunk));
+                Serial.printf("[VOICE] MicRMS=%d FeedRMS=%d rate=%u\n", rms, frms, in_rate);
+            }
+        }
 
-        // Fetch processed result (may block briefly)
-        afe_fetch_result_t *result = s_afe->fetch(s_afe_data);
-        if (!result) continue;
+        // Feed AFE
+        int feed_ret = s_afe->feed(s_afe_data, feed);
+        (void)feed_ret;
+
+        // Fetch processed result — blocks with timeout until AFE has a result ready
+        afe_fetch_result_t *result = s_afe->fetch_with_delay(s_afe_data, pdMS_TO_TICKS(200));
+        if (!result) {
+            continue;
+        }
+
+        // Log any non-trivial VAD or wake state
+        if (result->vad_state == AFE_VAD_SPEECH) {
+            static uint32_t last_vad_log = 0;
+            uint32_t now2 = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (now2 - last_vad_log > 1000) { last_vad_log = now2;
+                Serial.printf("[VOICE] VAD=SPEECH wakeup=%d\n", result->wakeup_state);
+            }
+        }
 
         if (!mn_active) {
-            if (result->wakeup_state == WAKENET_DETECTED) {
-                Serial.println("[VOICE] Wake word detected: Hi,喵喵!");
+            if (result->wakeup_state != WAKENET_NO_DETECT) {
+                Serial.printf("[VOICE] wakeup_state=%d\n", result->wakeup_state);
+            }
+            if (result->wakeup_state == WAKENET_DETECTED ||
+                result->wakeup_state == WAKENET_CHANNEL_VERIFIED) {
+                Serial.println("[VOICE] Wake word detected: 你好小智!");
                 s_multinet->clean(s_mn_data);
                 mn_active = true;
             }
@@ -207,10 +239,10 @@ void voice_sr_init(void)
     }
 
     // 2. Find WakeNet and MultiNet model names
-    char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "himiaomiao");
+    char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "nihaoxiaozhi");
     char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
     if (!wn_name) {
-        Serial.println("[VOICE] ERROR: wn9_himiaomiao_tts not found in models");
+        Serial.println("[VOICE] ERROR: wn9_nihaoxiaozhi not found in models");
         return;
     }
     if (!mn_name) {
@@ -221,14 +253,24 @@ void voice_sr_init(void)
     Serial.printf("[VOICE] MultiNet: %s\n", mn_name);
 
     // 3. Configure AFE (single mic, no AEC, 16 kHz)
+    // Note: afe_config_init with AFE_TYPE_SR auto-sets wakenet_init=true.
+    // We explicitly set wakenet_model_name to ensure the correct model is used.
     afe_config_t *afe_cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (!afe_cfg) {
         Serial.println("[VOICE] ERROR: afe_config_init failed");
         return;
     }
-    afe_cfg->wakenet_init       = true;
-    afe_cfg->wakenet_model_name = wn_name;
+    afe_cfg->wakenet_model_name = wn_name;       // explicitly use wn9_nihaoxiaozhi
     afe_cfg->memory_alloc_mode  = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    afe_cfg->ns_init            = false;          // disable NS: music background confuses NS
+    afe_cfg->afe_perferred_core     = 1;          // AFE internal tasks on Core 1
+    afe_cfg->afe_perferred_priority = 1;          // low priority — don't starve audio/UI
+    Serial.printf("[VOICE] AFE PCM: rate=%d ch=%d mic=%d ref=%d wn=%s\n",
+                  afe_cfg->pcm_config.sample_rate,
+                  afe_cfg->pcm_config.total_ch_num,
+                  afe_cfg->pcm_config.mic_num,
+                  afe_cfg->pcm_config.ref_num,
+                  afe_cfg->wakenet_model_name ? afe_cfg->wakenet_model_name : "(auto)");
 
     // 4. Create AFE instance
     s_afe = esp_afe_handle_from_config(afe_cfg);
@@ -243,6 +285,12 @@ void voice_sr_init(void)
         Serial.println("[VOICE] ERROR: AFE create_from_config failed");
         return;
     }
+
+    // Explicitly enable WakeNet detection
+    s_afe->enable_wakenet(s_afe_data);
+
+    // Note: set_wakenet_threshold returns -1 for TTS models (fixed threshold 0.636)
+    // We rely on the model's built-in threshold
 
     // 5. Create MultiNet instance and register Chinese commands
     s_multinet = esp_mn_handle_from_name(mn_name);
@@ -283,8 +331,8 @@ void voice_sr_init(void)
     // 7. Launch voice task on Core 0
     xTaskCreatePinnedToCore(voice_task, "voice_task",
                             8192, nullptr,
-                            3,    // priority (between cover_decode:2 and lvgl:5)
-                            nullptr, 0);
+                            2,    // priority: same as audio internal task, won't starve it
+                            nullptr, 1);   // Core 1 — keep Core 0 free for audio PeriodicTask
 
-    Serial.println("[VOICE] Voice recognition started — say 'Hi,喵喵' to activate");
+    Serial.println("[VOICE] Voice recognition started — say '你好小智' to activate");
 }

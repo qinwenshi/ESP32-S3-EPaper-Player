@@ -891,7 +891,8 @@ static void setup_audio_callbacks()
             break;
 
         case Audio::evt_eof:
-            is_playing = false;
+            // Keep is_playing=true so the auto-advance block in loop() fires.
+            // It will call play_track(cur_track+1) after the debounce delay.
             break;
 
         default: break;
@@ -1050,7 +1051,7 @@ void setup()
         Serial.println("ES8311 not found! Check wiring.");
     }
     codec.setSampleRate(44100);  // override default 48k; reconfigures for 44.1kHz MCLK
-    codec.setVolume(90);         // ~90% — louder default
+    codec.setVolume(40);         // default volume
     codec.enableMicrophone(true);  // enable ES8311 ADC path for voice recognition
     codec.setMicrophoneGain(7);    // max PGA gain (0-7)
     // Print register dump to confirm codec state

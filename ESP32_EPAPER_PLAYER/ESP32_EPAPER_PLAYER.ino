@@ -35,6 +35,7 @@
 #include <vector>
 #include <string>
 #include "voice_sr.h"
+#include "default_cover.h"
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 #define EPD_MOSI   13
@@ -234,9 +235,9 @@ static void build_screen()
     lv_obj_set_pos(img_cover, ART_X, ART_Y);
     lv_obj_set_style_border_width(img_cover, 1, 0);
     lv_obj_set_style_border_color(img_cover, lv_color_black(), 0);
-    // placeholder: dark grey fill
-    lv_obj_set_style_bg_color(img_cover, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_bg_opa(img_cover, LV_OPA_COVER, 0);
+    // Show default cat art until album art loads
+    load_default_cover();
+    lv_image_set_src(img_cover, &cover_dsc);
 
     // ── Song title ──
     lbl_title = lv_label_create(scr);
@@ -354,6 +355,16 @@ static void refresh_ui()
 
     // Play / pause icon
     lv_label_set_text(lbl_play_icon, is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Default cover art — copy pre-dithered cat bitmap into cover_buf
+// ─────────────────────────────────────────────────────────────────────────────
+static void load_default_cover()
+{
+    static_assert(sizeof(default_cover_data) == sizeof(cover_buf),
+                  "default_cover_data size must match cover_buf");
+    memcpy(cover_buf, default_cover_data, sizeof(cover_buf));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -799,9 +810,8 @@ static void play_track(int idx)
             if (has_cached_cover) {
                 lv_image_set_src(img_cover, &cover_dsc);
             } else {
-                lv_image_set_src(img_cover, NULL);
-                lv_obj_set_style_bg_color(img_cover, lv_color_hex(0x888888), 0);
-                lv_obj_set_style_bg_opa(img_cover, LV_OPA_COVER, 0);
+                load_default_cover();
+                lv_image_set_src(img_cover, &cover_dsc);
             }
             xSemaphoreGive(lvgl_mtx);
         }

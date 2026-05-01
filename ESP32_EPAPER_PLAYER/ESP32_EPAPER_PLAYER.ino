@@ -196,13 +196,13 @@ static void epd_flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map
     g_last_flush_ms = millis();
 
     // FULL render mode → px_map covers entire EPD_W × EPD_H frame in RGB565
+    // Rotate 90° CW: LVGL coord (x,y) → physical pixel (EPD_W-1-y, x)
     uint16_t *buf = (uint16_t*)px_map;
     for (int32_t y = 0; y < EPD_H; y++) {
         for (int32_t x = 0; x < EPD_W; x++) {
             uint16_t c = buf[y * EPD_W + x];
-            // Simple mid-point threshold: white if > 0x7FFF
             uint8_t col = (c > 0x7FFF) ? DRIVER_COLOR_WHITE : DRIVER_COLOR_BLACK;
-            epd->EPD_DrawColorPixel(x, y, col);
+            epd->EPD_DrawColorPixel(EPD_W - 1 - y, x, col);
         }
     }
     if (!g_silent_flush) {
@@ -1000,7 +1000,6 @@ void setup()
     lv_display_set_buffers(disp, lvgl_buf, nullptr, EPD_W * EPD_H * 2,
                            LV_DISPLAY_RENDER_MODE_FULL);
     lv_display_set_flush_cb(disp, epd_flush_cb);
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);  // rotate CW 90°
 
     // ── Build UI ──
     build_screen();

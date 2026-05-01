@@ -1050,7 +1050,7 @@ void setup()
         Serial.println("ES8311 not found! Check wiring.");
     }
     codec.setSampleRate(44100);  // override default 48k; reconfigures for 44.1kHz MCLK
-    codec.setVolume(70);         // ~70% (reg32=0xB2, near 0dB) — adjust as needed
+    codec.setVolume(90);         // ~90% — louder default
     codec.enableMicrophone(true);  // enable ES8311 ADC path for voice recognition
     codec.setMicrophoneGain(7);    // max PGA gain (0-7)
     // Print register dump to confirm codec state

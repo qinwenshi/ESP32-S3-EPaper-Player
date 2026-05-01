@@ -2,7 +2,7 @@
 // Wake word : "Hi ESP"  (wn9_hiesp — official Espressif model)
 // Commands  : English phrases (mn5q8_en)
 // Mic path  : ES8311 ADC → I2S1 slave (DIN=GPIO16, BCLK=GPIO15, WS=GPIO38)
-//             software-resample audio-rate → 16 kHz for AFE
+//             software-resample audio-rate → 16 kHz → WakeNet / MultiNet (no AFE)
 //
 // IMPORTANT: voice partition "model" must be flashed at 0x400000 with srmodels.bin.
 // For Hi ESP: use the official Arduino esp32s3 srmodels.bin (contains wn9_hiesp + mn5q8_en).
@@ -14,17 +14,16 @@
 #include "Arduino.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/stream_buffer.h"
 #include "esp_heap_caps.h"
 
 extern "C" {
 #include "driver/i2s_std.h"
 #include "driver/i2s_common.h"
-#include "esp_afe_sr_iface.h"
-#include "esp_afe_sr_models.h"
-#include "esp_afe_config.h"
+#include "esp_wn_iface.h"
+#include "esp_wn_models.h"
 #include "esp_mn_iface.h"
 #include "esp_mn_models.h"
-#include "esp_wn_models.h"
 #include "esp_mn_speech_commands.h"
 #include "model_path.h"
 }
@@ -36,27 +35,23 @@ extern "C" {
 #define MIC_WS_PIN    38
 #define MIC_DIN_PIN   16
 
-#define VOICE_SR_HZ   16000   // AFE requires 16 kHz input
+#define VOICE_SR_HZ   16000   // WakeNet / MultiNet require 16 kHz input
 
 // ── Module state ─────────────────────────────────────────────────────────────
-static volatile int      g_voice_cmd    = VOICE_CMD_NONE;
-static volatile uint32_t g_in_rate      = 44100;
-static volatile bool     s_listen_req   = false;  // set by voice_sr_start_listen()
-static volatile bool     s_mn_active    = false;  // true during command window
+static volatile int              g_voice_cmd    = VOICE_CMD_NONE;
+static volatile uint32_t         g_in_rate      = 44100;
+static volatile bool             s_listen_req   = false;
+static volatile bool             s_mn_active    = false;
+static int                       s_frame_offset = 0;
 
-// I2S1 frame-phase offset (0 or 2): which int16 slot within each 4-int16 group
-// contains the valid audio from the ES8311 ADC.
-// With a 32-bit I2S0 master and 16-bit I2S1 slave, there's a phase ambiguity:
-// I2S1 reads 2 sub-frames per I2S0 WS cycle. On each boot, the valid frame may
-// appear at stereo[i*4] (offset=0) or stereo[i*4+2] (offset=2).
-// Auto-detected below by comparing energy of the two slots during music playback.
-static int               s_frame_offset = 0;
-
-static i2s_chan_handle_t         s_i2s1_rx   = nullptr;
-static esp_afe_sr_data_t        *s_afe_data  = nullptr;
-static const esp_afe_sr_iface_t *s_afe       = nullptr;
-static const esp_mn_iface_t     *s_multinet  = nullptr;
-static model_iface_data_t       *s_mn_data   = nullptr;
+static i2s_chan_handle_t         s_i2s1_rx  = nullptr;
+static const esp_wn_iface_t     *s_wakenet  = nullptr;
+static model_iface_data_t       *s_wn_data  = nullptr;
+static const esp_mn_iface_t     *s_multinet = nullptr;
+static model_iface_data_t       *s_mn_data  = nullptr;
+static StreamBufferHandle_t      s_audio_buf = nullptr;
+static int                       s_wn_chunk  = 0;
+static int                       s_mn_chunk  = 0;
 
 // ── Two-stage resampler with anti-aliasing: in_rate → 16 kHz ─────────────────
 // Stage 1: decimate by 2 with 2-tap averaging (perfect LPF at in_rate/4 Hz,
@@ -114,43 +109,31 @@ static esp_err_t mic_i2s_init(void)
     return i2s_channel_enable(s_i2s1_rx);
 }
 
-// ── Voice task (runs on Core 0, priority 3) ───────────────────────────────────
-// Feed task: Core 0 — reads I2S, resamples, feeds AFE continuously
+// ── feed_task: Core 0 — reads I2S, resamples, pushes to StreamBuffer ─────────
 static void feed_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(500));  // wait for I2S0 clocks to stabilise
 
-    int afe_chunk      = s_afe->get_feed_chunksize(s_afe_data);
-    int feed_ch        = s_afe->get_feed_channel_num(s_afe_data);
-    // ROOT-CAUSE FIX: ESP32-audioI2S master uses 32-bit I2S slots.
-    // Our 16-bit slave reads 2 frames per actual WS cycle:
-    //   odd frames  → valid LEFT audio (MSB-16 of 32-bit LEFT slot)
-    //   even frames → zeros (MSB-16 of 32-bit RIGHT slot = 0 for mono ES8311)
-    // Fix: read 2× as many frames and take every other one (stereo[i*4] not stereo[i*2]).
-    // Effective sample rate is still in_rate; actual audio frames = frames_read / 2.
-    int max_i2s_frames = afe_chunk * 48000 / VOICE_SR_HZ * 2 + 8;
+    int max_i2s_frames = s_wn_chunk * 48000 / VOICE_SR_HZ * 2 + 8;
 
-    int16_t *stereo    = (int16_t *)heap_caps_malloc(max_i2s_frames * 4,          MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    int16_t *stereo    = (int16_t *)heap_caps_malloc(max_i2s_frames * 4,           MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     int16_t *mono      = (int16_t *)heap_caps_malloc((max_i2s_frames / 2 + 1) * 2, MALLOC_CAP_8BIT);
-    int16_t *resampled = (int16_t *)heap_caps_malloc(afe_chunk * 2,               MALLOC_CAP_8BIT);
-    int16_t *feed      = (int16_t *)heap_caps_malloc(afe_chunk * feed_ch * 2,     MALLOC_CAP_8BIT);
+    int16_t *resampled = (int16_t *)heap_caps_malloc(s_wn_chunk * 2,               MALLOC_CAP_8BIT);
 
-    if (!stereo || !mono || !resampled || !feed) {
+    if (!stereo || !mono || !resampled) {
         Serial.println("[VOICE] OOM in feed_task — aborted");
-        heap_caps_free(stereo); heap_caps_free(mono);
-        heap_caps_free(resampled); heap_caps_free(feed);
+        heap_caps_free(stereo); heap_caps_free(mono); heap_caps_free(resampled);
         vTaskDelete(nullptr);
         return;
     }
 
-    Serial.printf("[VOICE] feed_task started — chunk=%d feed_ch=%d\n", afe_chunk, feed_ch);
+    Serial.printf("[VOICE] feed_task started — wn_chunk=%d\n", s_wn_chunk);
 
     uint32_t last_rms_log = 0;
 
     for (;;) {
         uint32_t in_rate = g_in_rate;
-        // Need 2× frames_needed because only half the I2S frames contain valid audio
-        int frames_needed = afe_chunk * (int)in_rate / VOICE_SR_HZ * 2 + 4;
+        int frames_needed = s_wn_chunk * (int)in_rate / VOICE_SR_HZ * 2 + 4;
         if (frames_needed > max_i2s_frames) frames_needed = max_i2s_frames;
 
         size_t bytes_read = 0;
@@ -162,15 +145,10 @@ static void feed_task(void *arg)
             continue;
         }
 
-        int frames_read = (int)(bytes_read / 4);
-        // Only odd-indexed I2S frames contain actual audio (every 2nd frame is the
-        // 32-bit RIGHT slot which is zero for mono ES8311).
+        int frames_read    = (int)(bytes_read / 4);
         int actual_samples = frames_read / 2;
 
-        // ── Auto-detect I2S frame phase (0 or 2) ─────────────────────────────
-        // Compare energy of stereo[i*4] vs stereo[i*4+2]. The slot with 10×
-        // more energy is the valid audio slot. Only update when one is dominant
-        // (hysteresis: keep previous offset when both are quiet, e.g. during mute).
+        // Auto-detect I2S frame phase (0 or 2)
         {
             int64_t e0 = 0, e2 = 0;
             int n = (actual_samples < 32) ? actual_samples : 32;
@@ -180,27 +158,18 @@ static void feed_task(void *arg)
             }
             if      (e0 > e2 * 10) s_frame_offset = 0;
             else if (e2 > e0 * 10) s_frame_offset = 2;
-            // else: ambiguous (both quiet) — keep previous offset
         }
 
-        // Extract valid audio using detected offset.
-        // 4x software gain: raw speech RMS ~800, peak ~2500, ×4 = ~10000 — safe within int16.
-        // 1x was too low for MultiNet; 8x caused clipping (peak × 8 >> 32767).
+        // Extract valid audio with 4× software gain
         for (int i = 0; i < actual_samples; i++) {
             int v = (int)stereo[i * 4 + s_frame_offset] * 4;
             mono[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 
-        // Resample actual_samples @ in_rate → afe_chunk @ 16 kHz
-        int out_cnt = resample_to_16k(mono, actual_samples, in_rate, resampled, afe_chunk);
-        if (out_cnt < afe_chunk)
-            memset(resampled + out_cnt, 0, (afe_chunk - out_cnt) * sizeof(int16_t));
-
-        // Fill feed buffer
-        for (int i = 0; i < afe_chunk; i++) {
-            feed[i * feed_ch] = resampled[i];
-            for (int c = 1; c < feed_ch; c++) feed[i * feed_ch + c] = 0;
-        }
+        // Resample actual_samples @ in_rate → s_wn_chunk @ 16 kHz
+        int out_cnt = resample_to_16k(mono, actual_samples, in_rate, resampled, s_wn_chunk);
+        if (out_cnt < s_wn_chunk)
+            memset(resampled + out_cnt, 0, (s_wn_chunk - out_cnt) * sizeof(int16_t));
 
         // Periodic mic-level diagnostic (every 5 s)
         {
@@ -209,13 +178,11 @@ static void feed_task(void *arg)
                 last_rms_log = now_ms;
                 int64_t s2 = 0, f2 = 0;
                 for (int i = 0; i < actual_samples; i++) s2 += (int64_t)mono[i] * mono[i];
-                for (int i = 0; i < afe_chunk;      i++) f2 += (int64_t)resampled[i] * resampled[i];
+                for (int i = 0; i < s_wn_chunk;     i++) f2 += (int64_t)resampled[i] * resampled[i];
                 Serial.printf("[VOICE] MicRMS=%d FeedRMS=%d rate=%u frames_read=%d offset=%d\n",
                     (int)sqrtf((float)(s2 / actual_samples)),
-                    (int)sqrtf((float)(f2 / afe_chunk)),
+                    (int)sqrtf((float)(f2 / s_wn_chunk)),
                     in_rate, frames_read, s_frame_offset);
-                // Raw I2S frame dump: check interleaving pattern
-                // [i*4]=LEFT valid, [i*4+2]=RIGHT(zero for mono)
                 if (frames_read >= 8) {
                     Serial.printf("[VOICE] RAW[0..7]: %d %d %d %d | %d %d %d %d\n",
                         stereo[0], stereo[1], stereo[2], stereo[3],
@@ -224,94 +191,100 @@ static void feed_task(void *arg)
             }
         }
 
-        // Feed AFE — yield after feed so other tasks (watchdog, audio) get CPU time
-        s_afe->feed(s_afe_data, feed);
+        xStreamBufferSend(s_audio_buf, resampled,
+                          s_wn_chunk * sizeof(int16_t), pdMS_TO_TICKS(50));
         taskYIELD();
     }
 }
 
-// Detect task: Core 1 — fetches AFE results, runs WakeNet + MultiNet
+// ── detect_task: Core 1 — WakeNet + MultiNet on raw resampled audio ──────────
 static void detect_task(void *arg)
 {
     Serial.println("[VOICE] detect_task started");
 
+    int16_t *wn_buf = (int16_t *)heap_caps_malloc(s_wn_chunk * sizeof(int16_t), MALLOC_CAP_8BIT);
+    int16_t *mn_buf = (int16_t *)heap_caps_malloc(s_mn_chunk * sizeof(int16_t), MALLOC_CAP_8BIT);
+    if (!wn_buf || !mn_buf) {
+        Serial.println("[VOICE] OOM in detect_task");
+        heap_caps_free(wn_buf); heap_caps_free(mn_buf);
+        vTaskDelete(nullptr);
+        return;
+    }
+
     bool mn_active = false;
+    int  mn_pos    = 0;
     uint32_t last_diag = 0;
 
     for (;;) {
-        afe_fetch_result_t *result = s_afe->fetch(s_afe_data);
-        if (!result || result->ret_value == ESP_FAIL) {
-            static uint32_t last_fail = 0;
-            uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            if (now - last_fail > 2000) { last_fail = now;
-                Serial.printf("[VOICE] fetch failed ret=%d result=%p\n",
-                    result ? result->ret_value : -99, result);
-            }
-            continue;
-        }
+        size_t got = xStreamBufferReceive(s_audio_buf, wn_buf,
+                                          s_wn_chunk * sizeof(int16_t),
+                                          pdMS_TO_TICKS(500));
+        if (got < (size_t)(s_wn_chunk * sizeof(int16_t))) continue;
 
-        // Periodic diagnostics: dB volume + ring buffer fill (every 2 s)
+        // Periodic diagnostic every 2 s
         {
             uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
             if (now - last_diag > 2000) {
                 last_diag = now;
-                // Compute RMS of the data that WakeNet actually receives
-                int dsize = result->data_size / sizeof(int16_t);
-                int64_t d2 = 0;
-                if (result->data && dsize > 0)
-                    for (int i = 0; i < dsize; i++) d2 += (int64_t)result->data[i] * result->data[i];
-                int drms = dsize > 0 ? (int)sqrtf((float)(d2 / dsize)) : 0;
-                Serial.printf("[VOICE] DataRMS=%d(n=%d) vol=%.1fdB rbuf=%.2f vad=%d wakeup=%d\n",
-                    drms, dsize,
-                    result->data_volume,
-                    result->ringbuff_free_pct,
-                    result->vad_state,
-                    result->wakeup_state);
+                int64_t s2 = 0;
+                for (int i = 0; i < s_wn_chunk; i++) s2 += (int64_t)wn_buf[i] * wn_buf[i];
+                Serial.printf("[VOICE] RawRMS=%d mn_active=%d\n",
+                    (int)sqrtf((float)(s2 / s_wn_chunk)), mn_active ? 1 : 0);
             }
         }
 
         if (!mn_active) {
-            // Enter command mode on wake word OR manual trigger (voice_sr_start_listen)
             bool manual = s_listen_req;
             if (manual) s_listen_req = false;
 
-            if (result->wakeup_state != WAKENET_NO_DETECT && !manual)
-                Serial.printf("[VOICE] wakeup_state=%d\n", result->wakeup_state);
+            wakenet_state_t wn_state = s_wakenet->detect(s_wn_data, wn_buf);
 
-            bool wake_triggered = (result->wakeup_state == WAKENET_DETECTED ||
-                                   result->wakeup_state == WAKENET_CHANNEL_VERIFIED);
+            if (wn_state == WAKENET_DETECTED || wn_state == WAKENET_CHANNEL_VERIFIED)
+                Serial.println("[VOICE] *** Wake word 'Hi ESP' detected! ***");
 
-            if (manual || wake_triggered) {
-                if (manual)
-                    Serial.println("[VOICE] *** Manual listen activated — speak command ***");
-                else
-                    Serial.println("[VOICE] *** Wake word detected: Hi ESP! ***");
+            if (manual)
+                Serial.println("[VOICE] *** Manual listen activated — speak command ***");
+
+            if (manual || wn_state == WAKENET_DETECTED || wn_state == WAKENET_CHANNEL_VERIFIED) {
                 s_multinet->clean(s_mn_data);
-                mn_active  = true;
+                mn_active   = true;
                 s_mn_active = true;
+                mn_pos      = 0;
+                Serial.printf("[VOICE] MultiNet window open (chunk=%d)\n", s_mn_chunk);
             }
-        } else {
-            esp_mn_state_t mn_state = s_multinet->detect(s_mn_data, result->data);
-            // Fast DataRMS during command window so we can see speech effect
-            if (result->data && result->data_size > 0) {
-                int n = result->data_size / sizeof(int16_t);
-                int64_t d2 = 0;
-                for (int i = 0; i < n; i++) d2 += (int64_t)result->data[i] * result->data[i];
-                Serial.printf("[VOICE] CMD DataRMS=%d vad=%d\n",
-                    (int)sqrtf((float)(d2/n)), result->vad_state);
-            }
-            if (mn_state == ESP_MN_STATE_DETECTED) {
-                esp_mn_results_t *res = s_multinet->get_results(s_mn_data);
-                if (res && res->num > 0) {
-                    Serial.printf("[VOICE] Command %d detected\n", res->command_id[0]);
-                    g_voice_cmd = res->command_id[0];
+        }
+
+        if (mn_active) {
+            int space = s_mn_chunk - mn_pos;
+            int copy  = (s_wn_chunk < space) ? s_wn_chunk : space;
+            memcpy(mn_buf + mn_pos, wn_buf, copy * sizeof(int16_t));
+            mn_pos += copy;
+
+            if (mn_pos >= s_mn_chunk) {
+                {
+                    int64_t s2 = 0;
+                    for (int i = 0; i < s_mn_chunk; i++) s2 += (int64_t)mn_buf[i] * mn_buf[i];
+                    Serial.printf("[VOICE] CMD DataRMS=%d\n",
+                        (int)sqrtf((float)(s2 / s_mn_chunk)));
                 }
-                mn_active  = false;
-                s_mn_active = false;
-            } else if (mn_state == ESP_MN_STATE_TIMEOUT) {
-                Serial.println("[VOICE] Command timeout");
-                mn_active  = false;
-                s_mn_active = false;
+
+                esp_mn_state_t mn_state = s_multinet->detect(s_mn_data, mn_buf);
+                mn_pos = 0;
+
+                if (mn_state == ESP_MN_STATE_DETECTED) {
+                    esp_mn_results_t *res = s_multinet->get_results(s_mn_data);
+                    if (res && res->num > 0) {
+                        Serial.printf("[VOICE] Command %d detected: %s\n",
+                            res->command_id[0], res->string[0]);
+                        g_voice_cmd = res->command_id[0];
+                    }
+                    mn_active   = false;
+                    s_mn_active = false;
+                } else if (mn_state == ESP_MN_STATE_TIMEOUT) {
+                    Serial.println("[VOICE] Command timeout");
+                    mn_active   = false;
+                    s_mn_active = false;
+                }
             }
         }
     }
@@ -344,9 +317,9 @@ int voice_sr_get_cmd(void)
 
 void voice_sr_init(void)
 {
-    Serial.println("[VOICE] Initializing voice recognition...");
+    Serial.println("[VOICE] Initializing voice recognition (no-AFE direct WN+MN)...");
 
-    // 1. Load models from the "model" SPIFFS partition (srmodels.bin flashed at 0x400000)
+    // 1. Load models from the "model" SPIFFS partition
     srmodel_list_t *models = esp_srmodel_init("model");
     if (!models || models->num == 0) {
         Serial.println("[VOICE] ERROR: No models found in 'model' partition.");
@@ -354,86 +327,42 @@ void voice_sr_init(void)
         return;
     }
     Serial.printf("[VOICE] Models loaded: %d\n", models->num);
-    for (int i = 0; i < models->num; i++) {
+    for (int i = 0; i < models->num; i++)
         Serial.printf("[VOICE]   [%d] %s\n", i, models->model_name[i]);
-    }
 
     // 2. Find WakeNet and MultiNet model names
     char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "hiesp");
     char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
-    if (!wn_name) {
-        Serial.println("[VOICE] ERROR: wn9_hiesp not found in models");
-        return;
-    }
-    if (!mn_name) {
-        Serial.println("[VOICE] ERROR: mn5q8_en not found in models");
-        return;
-    }
+    if (!wn_name) { Serial.println("[VOICE] ERROR: wn9_hiesp not found in models"); return; }
+    if (!mn_name) { Serial.println("[VOICE] ERROR: mn5q8_en not found in models"); return; }
     Serial.printf("[VOICE] WakeNet: %s\n", wn_name);
     Serial.printf("[VOICE] MultiNet: %s\n", mn_name);
 
-    // 3. Configure AFE (single mic "M", 16 kHz, LOW_COST)
-    // Note: afe_config_init with AFE_TYPE_SR auto-sets wakenet_init=true.
-    // We explicitly set wakenet_model_name to ensure the correct model is used.
-    afe_config_t *afe_cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-    if (!afe_cfg) {
-        Serial.println("[VOICE] ERROR: afe_config_init failed");
-        return;
-    }
-    afe_cfg->wakenet_model_name = wn_name;       // explicitly use wn9_hiesp
-    afe_cfg->memory_alloc_mode  = AFE_MEMORY_ALLOC_MORE_PSRAM;
-    afe_cfg->ns_init            = false;          // keep NS disabled: causes OOM/reboot with LOW_COST mode
-    afe_cfg->afe_perferred_core     = 1;          // AFE internal tasks on Core 1
-    afe_cfg->afe_perferred_priority = 1;          // low priority — don't starve audio/UI
-    Serial.printf("[VOICE] AFE PCM: rate=%d ch=%d mic=%d ref=%d wn=%s\n",
-                  afe_cfg->pcm_config.sample_rate,
-                  afe_cfg->pcm_config.total_ch_num,
-                  afe_cfg->pcm_config.mic_num,
-                  afe_cfg->pcm_config.ref_num,
-                  afe_cfg->wakenet_model_name ? afe_cfg->wakenet_model_name : "(auto)");
+    // 3. Create WakeNet directly (no AFE)
+    s_wakenet = esp_wn_handle_from_name(wn_name);
+    if (!s_wakenet) { Serial.println("[VOICE] ERROR: esp_wn_handle_from_name failed"); return; }
+    s_wn_data = s_wakenet->create(wn_name, DET_MODE_90);
+    if (!s_wn_data) { Serial.println("[VOICE] ERROR: wakenet->create failed"); return; }
+    s_wn_chunk = s_wakenet->get_samp_chunksize(s_wn_data);
+    Serial.printf("[VOICE] WakeNet chunk=%d samples\n", s_wn_chunk);
 
-    // 4. Create AFE instance
-    s_afe = esp_afe_handle_from_config(afe_cfg);
-    if (!s_afe) {
-        Serial.println("[VOICE] ERROR: esp_afe_handle_from_config failed");
-        afe_config_free(afe_cfg);
-        return;
-    }
-    s_afe_data = s_afe->create_from_config(afe_cfg);
-    afe_config_free(afe_cfg);
-    if (!s_afe_data) {
-        Serial.println("[VOICE] ERROR: AFE create_from_config failed");
-        return;
-    }
-
-    // Explicitly enable WakeNet detection
-    s_afe->enable_wakenet(s_afe_data);
-
-    // Note: set_wakenet_threshold returns -1 for TTS models (fixed threshold 0.636)
-    // We rely on the model's built-in threshold
-
-    // 5. Create MultiNet instance and register Chinese commands
+    // 4. Create MultiNet directly
     s_multinet = esp_mn_handle_from_name(mn_name);
-    if (!s_multinet) {
-        Serial.println("[VOICE] ERROR: esp_mn_handle_from_name failed");
-        return;
-    }
-    s_mn_data = s_multinet->create(mn_name, 6000);  // 6 s detection window
-    if (!s_mn_data) {
-        Serial.println("[VOICE] ERROR: multinet->create failed");
-        return;
-    }
+    if (!s_multinet) { Serial.println("[VOICE] ERROR: esp_mn_handle_from_name failed"); return; }
+    s_mn_data = s_multinet->create(mn_name, 6000);
+    if (!s_mn_data) { Serial.println("[VOICE] ERROR: multinet->create failed"); return; }
+    s_mn_chunk = s_multinet->get_samp_chunksize(s_mn_data);
+    Serial.printf("[VOICE] MultiNet chunk=%d samples\n", s_mn_chunk);
 
-    // mn5q8_en phoneme constraints: avoid dense consonant clusters (/kst/ in "next",
-    // onset clusters like /pl/ in "play"). Use 2-3 syllable natural phrases.
+    // 5. Register commands
     esp_mn_commands_alloc(s_multinet, s_mn_data);
-    esp_mn_commands_add(VOICE_CMD_NEXT,     "change song");    // "next" /kst/ fails
+    esp_mn_commands_add(VOICE_CMD_NEXT,     "change song");
     esp_mn_commands_add(VOICE_CMD_NEXT,     "skip song");
     esp_mn_commands_add(VOICE_CMD_PREV,     "previous song");
     esp_mn_commands_add(VOICE_CMD_PREV,     "go to previous");
     esp_mn_commands_add(VOICE_CMD_PAUSE,    "pause");
     esp_mn_commands_add(VOICE_CMD_PAUSE,    "stop music");
-    esp_mn_commands_add(VOICE_CMD_RESUME,   "start music");    // "play" onset /pl/ fails
+    esp_mn_commands_add(VOICE_CMD_RESUME,   "start music");
     esp_mn_commands_add(VOICE_CMD_RESUME,   "resume music");
     esp_mn_commands_add(VOICE_CMD_VOL_UP,   "volume up");
     esp_mn_commands_add(VOICE_CMD_VOL_UP,   "turn up");
@@ -442,24 +371,29 @@ void voice_sr_init(void)
     esp_mn_error_t *mn_err = esp_mn_commands_update();
     if (mn_err && mn_err->num > 0) {
         Serial.printf("[VOICE] WARNING: %d command(s) could not be added:\n", mn_err->num);
-        for (int i = 0; i < mn_err->num; i++) {
+        for (int i = 0; i < mn_err->num; i++)
             Serial.printf("[VOICE]   cmd %d: %s\n",
                           mn_err->phrases[i]->command_id,
                           mn_err->phrases[i]->string);
-        }
     }
 
-    // 6. Init I2S1 in slave mode for mic input
+    // 6. Audio stream buffer: 40 WakeNet chunks of backlog (~12 800 bytes, fits in DRAM)
+    s_audio_buf = xStreamBufferCreate(s_wn_chunk * 40 * sizeof(int16_t),
+                                      s_wn_chunk * sizeof(int16_t));
+    if (!s_audio_buf) { Serial.println("[VOICE] ERROR: stream buffer alloc failed"); return; }
+
+    // 7. I2S1 init
     esp_err_t i2s_ret = mic_i2s_init();
     if (i2s_ret != ESP_OK) {
         Serial.printf("[VOICE] ERROR: I2S1 init failed: 0x%x\n", i2s_ret);
         return;
     }
 
-    // 7. Launch feed task (Core 0) + detect task (Core 1) — matches official esp32-hal-sr pattern
+    // 8. Launch tasks
     xTaskCreatePinnedToCore(feed_task,   "voice_feed",   4096, nullptr, 5, nullptr, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
     xTaskCreatePinnedToCore(detect_task, "voice_detect", 8192, nullptr, 5, nullptr, 1);
 
-    Serial.println("[VOICE] Voice recognition started — say 'Hi ESP' to activate");
+    Serial.printf("[VOICE] Started — WakeNet chunk=%d MultiNet chunk=%d — say 'Hi ESP'\n",
+                  s_wn_chunk, s_mn_chunk);
 }

@@ -505,25 +505,36 @@ static void cover_decode_task(void *)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SD file scan
+// SD file scan — recursive
 // ─────────────────────────────────────────────────────────────────────────────
+static void scan_dir_recursive(const String &path)
+{
+    File root = SD_MMC.open(path);
+    if (!root || !root.isDirectory()) { root.close(); return; }
+    File f;
+    while ((f = root.openNextFile())) {
+        String nm = String(f.name());
+        if (f.isDirectory()) {
+            String sub = path + (path.endsWith("/") ? "" : "/") + nm;
+            f.close();
+            scan_dir_recursive(sub);
+        } else if ((nm.endsWith(".mp3") || nm.endsWith(".MP3"))
+                   && !nm.startsWith("._")) {
+            tracks.push_back(path + (path.endsWith("/") ? "" : "/") + nm);
+            f.close();
+        } else {
+            f.close();
+        }
+    }
+    root.close();
+}
+
 static void scan_tracks()
 {
     tracks.clear();
-    for (const char *dir : {"/music", "/"}) {
-        File root = SD_MMC.open(dir);
-        if (!root || !root.isDirectory()) continue;
-        File f;
-        while ((f = root.openNextFile())) {
-            String nm = String(f.name());
-            if (!f.isDirectory() && (nm.endsWith(".mp3") || nm.endsWith(".MP3"))
-                    && !nm.startsWith("._"))  // skip macOS resource fork files
-                tracks.push_back(String(dir) + (String(dir)=="/" ? "" : "/") + nm);
-            f.close();
-        }
-        root.close();
-        if (!tracks.empty()) break;
-    }
+    scan_dir_recursive("/music");
+    if (tracks.empty())
+        scan_dir_recursive("/");
 }
 
 // Full EPD refresh then switch to partial mode (NO hardware reset → only 1 visible update)

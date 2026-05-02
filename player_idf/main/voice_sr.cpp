@@ -48,31 +48,45 @@ static StreamBufferHandle_t      s_audio_buf = nullptr;
 static int                       s_wn_chunk  = 0;
 static int                       s_mn_chunk  = 0;
 
-// ── Two-stage resampler with anti-aliasing: in_rate → 16 kHz ─────────────────
-// Stage 1: decimate by 2 with 2-tap averaging (perfect LPF at in_rate/4 Hz,
-//          e.g. 11025 Hz for 44100 input — exactly the Nyquist of half-rate)
-// Stage 2: linear interpolation at ~1.38x ratio (22050→16000) with negligible distortion
+// ── Two-stage stateful resampler: in_rate → 16 kHz ───────────────────────────
+// Stage 1: decimate by 2 with 2-tap averaging (LPF at in_rate/4 Hz)
+// Stage 2: linear interpolation (half_rate → 16000 Hz)
+// State persists across feed_task iterations so WakeNet LSTM sees a continuous stream.
+static struct {
+    uint32_t in_rate;
+    uint64_t pos;   // accumulated output-tick position (in units of half_rate ticks)
+} s_rs = {0, 0};
+
 static int resample_to_16k(const int16_t *in, int in_cnt, uint32_t in_rate,
                             int16_t *out, int out_max)
 {
-    uint32_t half_rate = in_rate / 2;  // 22050 Hz after stage-1 decimation
+    if (s_rs.in_rate != in_rate) {
+        s_rs.in_rate = in_rate;
+        s_rs.pos     = 0;  // reset on rate change
+    }
+
+    uint32_t half_rate = in_rate / 2;   // 22050 Hz for 44100
     int n = 0;
-    uint64_t pos = 0;  // tracks n * half_rate (avoids division per output sample)
 
     while (n < out_max) {
-        uint32_t i0 = (uint32_t)(pos / VOICE_SR_HZ);
+        uint32_t i0 = (uint32_t)(s_rs.pos / VOICE_SR_HZ);
         if ((int)(i0 * 2 + 3) >= in_cnt) break;
 
-        // Stage-1: average adjacent pair → half-rate sample
         int s0 = ((int)in[i0*2 + 0] + in[i0*2 + 1]) >> 1;
         int s1 = ((int)in[i0*2 + 2] + in[i0*2 + 3]) >> 1;
 
-        // Stage-2: linear interpolation between the two half-rate samples
-        int f = (int)((pos % VOICE_SR_HZ) * 256 / VOICE_SR_HZ);
+        int f  = (int)((s_rs.pos % VOICE_SR_HZ) * 256 / VOICE_SR_HZ);
         out[n] = (int16_t)(((256 - f) * s0 + f * s1) >> 8);
         ++n;
-        pos += half_rate;
+        s_rs.pos += half_rate;
     }
+
+    // Subtract consumed input so next chunk starts with correct fractional offset.
+    // i0_last is the highest half-rate index we used (needs s1 at i0_last+1).
+    uint32_t i0_last = (uint32_t)(s_rs.pos / VOICE_SR_HZ);
+    // next chunk's input[0] maps to old input[i0_last*2], so subtract that offset
+    s_rs.pos -= (uint64_t)i0_last * VOICE_SR_HZ;
+
     return n;
 }
 
@@ -87,7 +101,7 @@ static int resample_to_16k(const int16_t *in, int in_cnt, uint32_t in_rate,
 static esp_err_t mic_i2s_init(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
-    chan_cfg.dma_desc_num  = 4;
+    chan_cfg.dma_desc_num  = 8;   // 8×256×8B = 16KB ≈ 46ms buffer, prevents overflow
     chan_cfg.dma_frame_num = 256;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, nullptr, &s_mic_rx),
                         TAG_VSR, "I2S1 new_channel failed");
@@ -344,7 +358,7 @@ void voice_sr_init(void)
     // 3. Create WakeNet directly (no AFE)
     s_wakenet = esp_wn_handle_from_name(wn_name);
     if (!s_wakenet) { ESP_LOGI(TAG_VSR, "ERROR: esp_wn_handle_from_name failed"); return; }
-    s_wn_data = s_wakenet->create(wn_name, DET_MODE_90);
+    s_wn_data = s_wakenet->create(wn_name, DET_MODE_95);
     if (!s_wn_data) { ESP_LOGI(TAG_VSR, "ERROR: wakenet->create failed"); return; }
     s_wn_chunk = s_wakenet->get_samp_chunksize(s_wn_data);
     ESP_LOGI(TAG_VSR, "WakeNet chunk=%d samples", s_wn_chunk);

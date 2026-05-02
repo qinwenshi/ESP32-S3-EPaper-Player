@@ -44,5 +44,9 @@ CONFIG_I2S_ENABLE_DEBUG_LOG=n
 # SDMMC
 CONFIG_SDMMC_IO_POWER_DOMAIN_DEFAULT=n
 
+# FATFS long filename support (needed for .meta extension > 3 chars and proper track names)
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
 # NVS encryption off
 CONFIG_NVS_ENCRYPTION=n

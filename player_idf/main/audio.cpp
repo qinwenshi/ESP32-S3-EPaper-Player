@@ -51,7 +51,8 @@ static void audio_i2s_init(int bclk, int ws, int dout, int mclk, uint32_t rate)
     chan_cfg.dma_frame_num = 256;  // 256×8B=2KB/desc, well within DMA 4092B limit
     i2s_new_channel(&chan_cfg, &s_i2s_tx, &s_i2s_rx);
 
-    i2s_std_config_t std_cfg = {
+    // TX config: master generates BCLK/WS/MCLK, sends DOUT, DIN unused
+    i2s_std_config_t tx_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
                                                          I2S_SLOT_MODE_STEREO),
@@ -60,7 +61,7 @@ static void audio_i2s_init(int bclk, int ws, int dout, int mclk, uint32_t rate)
             .bclk = (gpio_num_t)bclk,
             .ws   = (gpio_num_t)ws,
             .dout = (gpio_num_t)dout,
-            .din  = GPIO_NUM_16,   // ES8311 ADC → mic capture
+            .din  = I2S_GPIO_UNUSED,   // TX does not use DIN
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -68,8 +69,17 @@ static void audio_i2s_init(int bclk, int ws, int dout, int mclk, uint32_t rate)
             },
         },
     };
-    i2s_channel_init_std_mode(s_i2s_tx, &std_cfg);
-    i2s_channel_init_std_mode(s_i2s_rx, &std_cfg);
+    i2s_channel_init_std_mode(s_i2s_tx, &tx_cfg);
+
+    // RX config: BCLK/WS/MCLK are already driven by TX — only configure DIN
+    i2s_std_config_t rx_cfg = tx_cfg;           // copy clock + slot config
+    rx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+    rx_cfg.gpio_cfg.bclk = I2S_GPIO_UNUSED;
+    rx_cfg.gpio_cfg.ws   = I2S_GPIO_UNUSED;
+    rx_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
+    rx_cfg.gpio_cfg.din  = GPIO_NUM_16;         // ES8311 SDOUT → ESP32 DIN
+    i2s_channel_init_std_mode(s_i2s_rx, &rx_cfg);
+
     i2s_channel_enable(s_i2s_tx);
     i2s_channel_enable(s_i2s_rx);
 }

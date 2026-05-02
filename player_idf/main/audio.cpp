@@ -48,7 +48,7 @@ static void audio_i2s_init(int bclk, int ws, int dout, int mclk, uint32_t rate)
     // Create I2S0 in DUPLEX mode: TX for speaker, RX for mic (ES8311 DOUT/DIN share clock)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num  = 8;
-    chan_cfg.dma_frame_num = 512;
+    chan_cfg.dma_frame_num = 256;  // 256×8B=2KB/desc, well within DMA 4092B limit
     i2s_new_channel(&chan_cfg, &s_i2s_tx, &s_i2s_rx);
 
     i2s_std_config_t std_cfg = {

@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "driver/i2s_std.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +18,9 @@ typedef void (*audio_image_cb_t)(uint32_t file_offset, uint32_t byte_len);
 typedef void (*audio_eof_cb_t)(void);
 
 void audio_init(int bclk, int ws, int dout, int mclk);
+// Returns the I2S0 RX handle (duplex mic channel, 32-bit Philips, 44100 Hz).
+// Valid only after audio_init(). Used by voice_sr to read mic data.
+i2s_chan_handle_t audio_get_i2s_rx(void);
 void audio_set_callbacks(audio_meta_cb_t meta_cb,
                           audio_image_cb_t image_cb,
                           audio_eof_cb_t eof_cb);

@@ -1,15 +1,12 @@
 // voice_sr.cpp — Wake word + speech command recognition using ESP-SR
 // Wake word : "Hi ESP"  (wn9_hiesp — official Espressif model)
 // Commands  : English phrases (mn5q8_en)
-// Mic path  : ES8311 ADC → I2S1 slave (DIN=GPIO16, BCLK=GPIO15, WS=GPIO38)
-//             software-resample audio-rate → 16 kHz → WakeNet / MultiNet (no AFE)
+// Mic path  : ES8311 ADC → I2S0 RX (duplex with audio TX, 32-bit Philips, shared clock)
+//             Audio sample in high 16 bits of 32-bit L slot → (int16_t)(raw32 >> 16)
+//             Software-resample audio-rate → 16 kHz → WakeNet / MultiNet (no AFE)
 //
 // IMPORTANT: voice partition "model" must be flashed at 0x400000 with srmodels.bin.
 // For Hi ESP: use the official Arduino esp32s3 srmodels.bin (contains wn9_hiesp + mn5q8_en).
-//
-// I2S NOTE: I2S0 (audio) uses 32-bit slots. I2S1 slave with 16-bit slot_bit_width
-// reads 2 frames per WS cycle — only even frames are valid. We read 2x frames and
-// take every-other (stereo[i*4]) to reconstruct clean 44100 Hz audio.
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,12 +27,8 @@ extern "C" {
 #include "model_path.h"
 }
 
+#include "audio.h"
 #include "voice_sr.h"
-
-// ── Hardware pins ────────────────────────────────────────────────────────────
-#define MIC_BCLK_PIN  15
-#define MIC_WS_PIN    38
-#define MIC_DIN_PIN   16
 
 #define VOICE_SR_HZ   16000   // WakeNet / MultiNet require 16 kHz input
 
@@ -44,9 +37,8 @@ static volatile int              g_voice_cmd    = VOICE_CMD_NONE;
 static volatile uint32_t         g_in_rate      = 44100;
 static volatile bool             s_listen_req   = false;
 static volatile bool             s_mn_active    = false;
-static int                       s_frame_offset = 0;
 
-static i2s_chan_handle_t         s_i2s1_rx  = nullptr;
+static i2s_chan_handle_t         s_mic_rx   = nullptr;  // I2S0 RX (duplex with audio TX)
 static const esp_wn_iface_t     *s_wakenet  = nullptr;
 static model_iface_data_t       *s_wn_data  = nullptr;
 static const esp_mn_iface_t     *s_multinet = nullptr;
@@ -83,44 +75,21 @@ static int resample_to_16k(const int16_t *in, int in_cnt, uint32_t in_rate,
     return n;
 }
 
-// ── I2S1 slave init (reads mic from ES8311 via shared I2S0 clocks) ───────────
-static esp_err_t mic_i2s_init(void)
-{
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
-    chan_cfg.dma_desc_num  = 8;
-    chan_cfg.dma_frame_num = 256;
-    esp_err_t ret = i2s_new_channel(&chan_cfg, nullptr, &s_i2s1_rx);
-    if (ret != ESP_OK) return ret;
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),   // unused in slave mode
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = (gpio_num_t)MIC_BCLK_PIN,
-            .ws   = (gpio_num_t)MIC_WS_PIN,
-            .dout = I2S_GPIO_UNUSED,
-            .din  = (gpio_num_t)MIC_DIN_PIN,
-        },
-    };
-
-    ret = i2s_channel_init_std_mode(s_i2s1_rx, &std_cfg);
-    if (ret != ESP_OK) return ret;
-
-    return i2s_channel_enable(s_i2s1_rx);
-}
-
-// ── feed_task: Core 0 — reads I2S, resamples, pushes to StreamBuffer ─────────
+// ── feed_task: Core 0 — reads I2S0 RX (duplex), resamples → StreamBuffer ──────
+// I2S0 RX is 32-bit Philips stereo (same config as TX).
+// ES8311 ADC outputs the mic sample in the high 16 bits of each 32-bit L slot.
+// Extraction: (int16_t)(raw32[i*2] >> 16)  — take L channel, drop R (zeros).
 static void feed_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(500));  // wait for I2S0 clocks to stabilise
 
-    int max_i2s_frames = s_wn_chunk * 48000 / VOICE_SR_HZ * 2 + 8;
+    // max input frames to read per iteration (at highest possible rate, 48 kHz)
+    int max_i2s_frames = s_wn_chunk * 48000 / VOICE_SR_HZ + 8;
 
-    int16_t *stereo    = (int16_t *)heap_caps_malloc(max_i2s_frames * 4,           MALLOC_CAP_SPIRAM);
-    int16_t *mono      = (int16_t *)heap_caps_malloc((max_i2s_frames / 2 + 1) * 2, MALLOC_CAP_SPIRAM);
-    int16_t *resampled = (int16_t *)heap_caps_malloc(s_wn_chunk * 2,               MALLOC_CAP_SPIRAM);
+    // 32-bit stereo: 8 bytes per frame
+    int32_t *stereo    = (int32_t *)heap_caps_malloc(max_i2s_frames * 8,  MALLOC_CAP_SPIRAM);
+    int16_t *mono      = (int16_t *)heap_caps_malloc(max_i2s_frames * 2,  MALLOC_CAP_SPIRAM);
+    int16_t *resampled = (int16_t *)heap_caps_malloc(s_wn_chunk * 2,      MALLOC_CAP_SPIRAM);
 
     if (!stereo || !mono || !resampled) {
         ESP_LOGI(TAG_VSR, "OOM in feed_task — aborted");
@@ -135,36 +104,25 @@ static void feed_task(void *arg)
 
     for (;;) {
         uint32_t in_rate = g_in_rate;
-        int frames_needed = s_wn_chunk * (int)in_rate / VOICE_SR_HZ * 2 + 4;
+        int frames_needed = s_wn_chunk * (int)in_rate / VOICE_SR_HZ + 4;
         if (frames_needed > max_i2s_frames) frames_needed = max_i2s_frames;
 
         size_t bytes_read = 0;
-        esp_err_t ret = i2s_channel_read(s_i2s1_rx, stereo,
-                                          frames_needed * 4, &bytes_read,
+        esp_err_t ret = i2s_channel_read(s_mic_rx, stereo,
+                                          frames_needed * 8, &bytes_read,
                                           pdMS_TO_TICKS(200));
-        if (ret != ESP_OK || bytes_read < 8) {
+        if (ret != ESP_OK || bytes_read < 16) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
-        int frames_read    = (int)(bytes_read / 4);
-        int actual_samples = frames_read / 2;
+        // 32-bit stereo frame = 8 bytes → L (4 bytes) + R (4 bytes)
+        // ES8311 ADC: audio in high 16 bits of L slot (Philips format)
+        int actual_samples = (int)(bytes_read / 8);
 
-        // Auto-detect I2S frame phase (0 or 2)
-        {
-            int64_t e0 = 0, e2 = 0;
-            int n = (actual_samples < 32) ? actual_samples : 32;
-            for (int i = 0; i < n; i++) {
-                e0 += (int64_t)stereo[i*4]   * stereo[i*4];
-                e2 += (int64_t)stereo[i*4+2] * stereo[i*4+2];
-            }
-            if      (e0 > e2 * 10) s_frame_offset = 0;
-            else if (e2 > e0 * 10) s_frame_offset = 2;
-        }
-
-        // Extract valid audio with 4× software gain
+        // Extract L channel with 4× software gain
         for (int i = 0; i < actual_samples; i++) {
-            int v = (int)stereo[i * 4 + s_frame_offset] * 4;
+            int v = (int)(int16_t)(stereo[i * 2] >> 16) * 4;
             mono[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 
@@ -181,14 +139,14 @@ static void feed_task(void *arg)
                 int64_t s2 = 0, f2 = 0;
                 for (int i = 0; i < actual_samples; i++) s2 += (int64_t)mono[i] * mono[i];
                 for (int i = 0; i < s_wn_chunk;     i++) f2 += (int64_t)resampled[i] * resampled[i];
-                ESP_LOGI(TAG_VSR, "MicRMS=%d FeedRMS=%d rate=%u frames_read=%d offset=%d",
+                ESP_LOGI(TAG_VSR, "MicRMS=%d FeedRMS=%d rate=%u frames=%d",
                     (int)sqrtf((float)(s2 / actual_samples)),
                     (int)sqrtf((float)(f2 / s_wn_chunk)),
-                    in_rate, frames_read, s_frame_offset);
-                if (frames_read >= 8) {
-                    ESP_LOGI(TAG_VSR, "RAW[0..7]: %d %d %d %d | %d %d %d %d",
-                        stereo[0], stereo[1], stereo[2], stereo[3],
-                        stereo[4], stereo[5], stereo[6], stereo[7]);
+                    in_rate, actual_samples);
+                if (actual_samples >= 4) {
+                    ESP_LOGI(TAG_VSR, "RAW32[0..3]: %d %d %d %d",
+                        (int)(int16_t)(stereo[0] >> 16), (int)(int16_t)(stereo[2] >> 16),
+                        (int)(int16_t)(stereo[4] >> 16), (int)(int16_t)(stereo[6] >> 16));
                 }
             }
         }
@@ -198,6 +156,7 @@ static void feed_task(void *arg)
         taskYIELD();
     }
 }
+
 
 // ── detect_task: Core 1 — WakeNet + MultiNet on raw resampled audio ──────────
 static void detect_task(void *arg)
@@ -390,10 +349,10 @@ void voice_sr_init(void)
     }
     if (!s_audio_buf) { ESP_LOGI(TAG_VSR, "ERROR: stream buffer alloc failed"); return; }
 
-    // 7. I2S1 init
-    esp_err_t i2s_ret = mic_i2s_init();
-    if (i2s_ret != ESP_OK) {
-        ESP_LOGI(TAG_VSR, "ERROR: I2S1 init failed: 0x%x", i2s_ret);
+    // 7. Get I2S0 RX handle from audio module (duplex with speaker TX, 32-bit Philips)
+    s_mic_rx = audio_get_i2s_rx();
+    if (!s_mic_rx) {
+        ESP_LOGI(TAG_VSR, "ERROR: I2S0 RX not ready — call audio_init() first");
         return;
     }
 

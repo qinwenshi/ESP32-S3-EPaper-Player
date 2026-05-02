@@ -1,0 +1,13 @@
+## IDF Component Manager manifest
+dependencies:
+  idf: ">=5.5.0"
+
+  ## LVGL graphics library
+  lvgl/lvgl:
+    version: "~9.2.0"
+    rules:
+      - if: "idf_version >=5.0.0"
+
+  ## ESP-SR voice recognition (WakeNet + MultiNet)
+  espressif/esp-sr:
+    version: "~2.4.3"

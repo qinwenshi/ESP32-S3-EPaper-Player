@@ -1,0 +1,35 @@
+idf_component_register(
+    SRCS
+        "app_main.cpp"
+        "audio.cpp"
+        "sdcard.cpp"
+        "codec.cpp"
+        "nvs_state.cpp"
+        "buttons.cpp"
+        "voice_sr.cpp"
+        "font_cubic11_11.c"
+        "font_cubic11_14.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        esp_timer
+        esp_psram
+        nvs_flash
+        fatfs
+        sdmmc
+        freertos
+        esp_hw_support
+        heap
+        log
+        spi_flash
+        esp_system
+        epaper_bsp
+        minimp3
+    PRIV_REQUIRES
+        esp_driver_i2s
+        esp_driver_spi
+        esp_driver_i2c
+        esp_driver_sdmmc
+        esp_driver_gpio
+)

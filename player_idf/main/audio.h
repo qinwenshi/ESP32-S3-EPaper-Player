@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "freertos/stream_buffer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +35,10 @@ uint32_t audio_get_current_time(void);
 uint32_t audio_get_duration(void);
 // Seek to position in seconds (crude: byte-offset estimate)
 void audio_seek(uint32_t seconds);
+
+// Reference audio stream for voice AEC: speaker PCM at current playback rate,
+// 16-bit mono L-channel samples. Consumed by voice_sr feed_task.
+StreamBufferHandle_t audio_get_ref_stream(void);
 
 // Volume: 0-100 (applied to I2S output scale)
 // (primary volume control is codec; this is software trim)

@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "freertos/stream_buffer.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_common.h"
 #include "esp_heap_caps.h"
@@ -22,6 +23,12 @@ static i2s_chan_handle_t  s_i2s_tx       = nullptr;
 static audio_meta_cb_t    s_meta_cb      = nullptr;
 static audio_image_cb_t   s_image_cb     = nullptr;
 static audio_eof_cb_t     s_eof_cb       = nullptr;
+
+// Reference stream buffer for voice AEC: 16-bit mono L-channel at playback rate.
+// Size: ~16K samples = ~370 ms at 44.1 kHz — provides scheduling slack.
+// Non-blocking send: if full (voice_sr too slow) drop silently.
+static StreamBufferHandle_t s_ref_stream  = nullptr;
+static int16_t              s_ref_tmp[1152]; // temp L-channel extract (max one MP3 frame)
 
 static char               s_current_path[512];
 static volatile bool      s_is_running   = false;
@@ -308,6 +315,22 @@ static void audio_task(void *arg)
                 // Convert 16-bit stereo/mono → 32-bit stereo
                 int ch         = info.channels;
                 int out_frames = samples / ch;
+
+                // Tap L-channel mono into reference stream buffer for voice AEC.
+                // Send entire frame atomically; drop silently if buffer full.
+                if (s_ref_stream) {
+                    size_t needed = (size_t)out_frames * sizeof(int16_t);
+                    if (xStreamBufferSpacesAvailable(s_ref_stream) >= needed) {
+                        if (ch == 1) {
+                            xStreamBufferSend(s_ref_stream, pcm_buf, needed, 0);
+                        } else {
+                            for (int i = 0; i < out_frames; i++)
+                                s_ref_tmp[i] = pcm_buf[i * 2]; // L channel
+                            xStreamBufferSend(s_ref_stream, s_ref_tmp, needed, 0);
+                        }
+                    }
+                }
+
                 for (int i = 0; i < out_frames; i++) {
                     i2s_buf[i*2 + 0] = (int32_t)pcm_buf[i*ch + 0]             << 16;
                     i2s_buf[i*2 + 1] = (int32_t)pcm_buf[i*ch + (ch > 1 ? 1 : 0)] << 16;
@@ -354,6 +377,13 @@ void audio_init(int bclk, int ws, int dout, int mclk)
     s_pin_dout = dout;
     s_pin_mclk = mclk;
     audio_i2s_init(bclk, ws, dout, mclk, 44100);
+
+    // Reference stream buffer for AEC: 16384 int16 samples ≈ 372 ms at 44.1 kHz
+    s_ref_stream = xStreamBufferCreateWithCaps(16384 * sizeof(int16_t), 1,
+                                               MALLOC_CAP_SPIRAM);
+    if (!s_ref_stream)
+        ESP_LOGW(TAG, "audio_init: ref stream buffer alloc failed — AEC disabled");
+
     ESP_LOGI(TAG, "audio_init: bclk=%d ws=%d dout=%d mclk=%d", bclk, ws, dout, mclk);
 }
 
@@ -428,4 +458,9 @@ uint32_t audio_get_duration(void)
 void audio_seek(uint32_t seconds)
 {
     s_seek_to = seconds;
+}
+
+StreamBufferHandle_t audio_get_ref_stream(void)
+{
+    return s_ref_stream;
 }

@@ -176,10 +176,9 @@ static void feed_task(void *arg)
         // ES8311 ADC: audio in high 16 bits of L slot (Philips format)
         int actual_samples = (int)(bytes_read / 8);
 
-        // Extract L channel with 4× software gain
+        // Extract L channel — no software gain (codec gain already at 36 dB)
         for (int i = 0; i < actual_samples; i++) {
-            int v = (int)(int16_t)(stereo[i * 2] >> 16) * 4;
-            mono[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+            mono[i] = (int16_t)(stereo[i * 2] >> 16);
         }
 
         // Resample actual_samples @ in_rate → s_wn_chunk @ 16 kHz

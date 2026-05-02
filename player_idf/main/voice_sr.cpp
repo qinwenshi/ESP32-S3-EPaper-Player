@@ -1,8 +1,9 @@
 // voice_sr.cpp — Wake word + speech command recognition using ESP-SR
 // Wake word : "Hi ESP"  (wn9_hiesp — official Espressif model)
 // Commands  : English phrases (mn5q8_en)
-// Mic path  : ES8311 ADC → I2S0 RX (duplex with audio TX, 32-bit Philips, shared clock)
-//             Audio sample in high 16 bits of 32-bit L slot → (int16_t)(raw32 >> 16)
+// Mic path  : ES8311 ADC → I2S1 slave (32-bit Philips, BCLK/WS from I2S0 master)
+//             I2S1 configured with slot_bit_width=32, data_bit_width=16.
+//             Audio in high 16 bits of 32-bit L slot → (int16_t)(raw32 >> 16)
 //             Software-resample audio-rate → 16 kHz → WakeNet / MultiNet (no AFE)
 //
 // IMPORTANT: voice partition "model" must be flashed at 0x400000 with srmodels.bin.
@@ -19,6 +20,7 @@ static const char* TAG_VSR = "VOICE";
 extern "C" {
 #include "driver/i2s_std.h"
 #include "driver/i2s_common.h"
+#include "esp_check.h"
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
 #include "esp_mn_iface.h"
@@ -27,7 +29,6 @@ extern "C" {
 #include "model_path.h"
 }
 
-#include "audio.h"
 #include "voice_sr.h"
 
 #define VOICE_SR_HZ   16000   // WakeNet / MultiNet require 16 kHz input
@@ -38,7 +39,7 @@ static volatile uint32_t         g_in_rate      = 44100;
 static volatile bool             s_listen_req   = false;
 static volatile bool             s_mn_active    = false;
 
-static i2s_chan_handle_t         s_mic_rx   = nullptr;  // I2S0 RX (duplex with audio TX)
+static i2s_chan_handle_t         s_mic_rx   = nullptr;  // I2S1 slave RX (mic capture)
 static const esp_wn_iface_t     *s_wakenet  = nullptr;
 static model_iface_data_t       *s_wn_data  = nullptr;
 static const esp_mn_iface_t     *s_multinet = nullptr;
@@ -75,10 +76,51 @@ static int resample_to_16k(const int16_t *in, int in_cnt, uint32_t in_rate,
     return n;
 }
 
-// ── feed_task: Core 0 — reads I2S0 RX (duplex), resamples → StreamBuffer ──────
-// I2S0 RX is 32-bit Philips stereo (same config as TX).
-// ES8311 ADC outputs the mic sample in the high 16 bits of each 32-bit L slot.
-// Extraction: (int16_t)(raw32[i*2] >> 16)  — take L channel, drop R (zeros).
+// ── I2S1 slave mic init ──────────────────────────────────────────────────────
+// I2S1 is a SLAVE: receives BCLK/WS from I2S0 master (same pins).
+// slot_bit_width=32 to match I2S0 master's 32-bit Philips format.
+// ES8311 ADC output (16-bit) lands in bits[31:16] of each 32-bit slot.
+#define MIC_BCLK_PIN   GPIO_NUM_15
+#define MIC_WS_PIN     GPIO_NUM_38
+#define MIC_DIN_PIN    GPIO_NUM_16
+
+static esp_err_t mic_i2s_init(uint32_t rate)
+{
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_SLAVE);
+    chan_cfg.dma_desc_num  = 4;
+    chan_cfg.dma_frame_num = 256;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, nullptr, &s_mic_rx),
+                        TAG_VSR, "I2S1 new_channel failed");
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                         I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = MIC_BCLK_PIN,
+            .ws   = MIC_WS_PIN,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = MIC_DIN_PIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
+    };
+    // Match I2S0 master's 32-bit slot width so the BCLK frames align.
+    // ES8311 ADC sends 16-bit audio left-justified: audio lands in bits[31:16].
+    std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_mic_rx, &std_cfg),
+                        TAG_VSR, "I2S1 init_std_mode failed");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_mic_rx),
+                        TAG_VSR, "I2S1 enable failed");
+    return ESP_OK;
+}
+
+// ── feed_task: Core 0 — reads I2S1 RX (slave), resamples → StreamBuffer ──────
 static void feed_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(500));  // wait for I2S0 clocks to stabilise
@@ -349,10 +391,9 @@ void voice_sr_init(void)
     }
     if (!s_audio_buf) { ESP_LOGI(TAG_VSR, "ERROR: stream buffer alloc failed"); return; }
 
-    // 7. Get I2S0 RX handle from audio module (duplex with speaker TX, 32-bit Philips)
-    s_mic_rx = audio_get_i2s_rx();
-    if (!s_mic_rx) {
-        ESP_LOGI(TAG_VSR, "ERROR: I2S0 RX not ready — call audio_init() first");
+    // 7. Init I2S1 slave for mic capture (32-bit slot, BCLK/WS from I2S0 master)
+    if (mic_i2s_init(44100) != ESP_OK) {
+        ESP_LOGI(TAG_VSR, "ERROR: mic I2S1 init failed");
         return;
     }
 

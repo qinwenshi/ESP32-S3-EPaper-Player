@@ -19,7 +19,6 @@ static const char *TAG = "audio";
 
 // ── State ────────────────────────────────────────────────────────────────────
 static i2s_chan_handle_t  s_i2s_tx       = nullptr;
-static i2s_chan_handle_t  s_i2s_rx       = nullptr;  // duplex RX for mic capture
 static audio_meta_cb_t    s_meta_cb      = nullptr;
 static audio_image_cb_t   s_image_cb     = nullptr;
 static audio_eof_cb_t     s_eof_cb       = nullptr;
@@ -45,14 +44,13 @@ static int s_pin_bclk, s_pin_ws, s_pin_dout, s_pin_mclk;
 
 static void audio_i2s_init(int bclk, int ws, int dout, int mclk, uint32_t rate)
 {
-    // Create I2S0 in DUPLEX mode: TX for speaker, RX for mic (ES8311 DOUT/DIN share clock)
+    // Create I2S0 TX only (speaker output). Mic uses I2S1 slave separately.
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num  = 8;
-    chan_cfg.dma_frame_num = 256;  // 256×8B=2KB/desc, well within DMA 4092B limit
-    i2s_new_channel(&chan_cfg, &s_i2s_tx, &s_i2s_rx);
+    chan_cfg.dma_frame_num = 512;
+    i2s_new_channel(&chan_cfg, &s_i2s_tx, nullptr);
 
-    // TX config: master generates BCLK/WS/MCLK, sends DOUT, DIN unused
-    i2s_std_config_t tx_cfg = {
+    i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
                                                          I2S_SLOT_MODE_STEREO),
@@ -61,7 +59,7 @@ static void audio_i2s_init(int bclk, int ws, int dout, int mclk, uint32_t rate)
             .bclk = (gpio_num_t)bclk,
             .ws   = (gpio_num_t)ws,
             .dout = (gpio_num_t)dout,
-            .din  = I2S_GPIO_UNUSED,   // TX does not use DIN
+            .din  = I2S_GPIO_UNUSED,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -69,31 +67,17 @@ static void audio_i2s_init(int bclk, int ws, int dout, int mclk, uint32_t rate)
             },
         },
     };
-    i2s_channel_init_std_mode(s_i2s_tx, &tx_cfg);
-
-    // RX config: BCLK/WS/MCLK are already driven by TX — only configure DIN
-    i2s_std_config_t rx_cfg = tx_cfg;           // copy clock + slot config
-    rx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-    rx_cfg.gpio_cfg.bclk = I2S_GPIO_UNUSED;
-    rx_cfg.gpio_cfg.ws   = I2S_GPIO_UNUSED;
-    rx_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
-    rx_cfg.gpio_cfg.din  = GPIO_NUM_16;         // ES8311 SDOUT → ESP32 DIN
-    i2s_channel_init_std_mode(s_i2s_rx, &rx_cfg);
-
+    i2s_channel_init_std_mode(s_i2s_tx, &std_cfg);
     i2s_channel_enable(s_i2s_tx);
-    i2s_channel_enable(s_i2s_rx);
 }
 
 // Reinitialise at a new sample rate (track changed rate mid-stream).
 static void audio_i2s_set_rate(uint32_t rate)
 {
-    // Both TX and RX share the I2S0 clock — disable both for clean reconfiguration
-    i2s_channel_disable(s_i2s_rx);
     i2s_channel_disable(s_i2s_tx);
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
     i2s_channel_reconfig_std_clock(s_i2s_tx, &clk);
     i2s_channel_enable(s_i2s_tx);
-    i2s_channel_enable(s_i2s_rx);
     ESP_LOGI(TAG, "I2S sample rate changed to %" PRIu32 " Hz", rate);
 }
 
@@ -444,9 +428,4 @@ uint32_t audio_get_duration(void)
 void audio_seek(uint32_t seconds)
 {
     s_seek_to = seconds;
-}
-
-i2s_chan_handle_t audio_get_i2s_rx(void)
-{
-    return s_i2s_rx;
 }

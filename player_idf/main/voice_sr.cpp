@@ -2,12 +2,15 @@
 // Wake word : "Hi ESP"  (wn9_hiesp — official Espressif model)
 // Commands  : English phrases (mn5q8_en)
 //
-// Architecture (MR = 1 mic + 1 ref, AEC with minimal filter to reduce over-suppression):
+// Architecture (M = 1 mic, NO AEC, HIGH_PERF mode):
 //   I2S1 slave mic (32-bit slot, BCLK/WS from I2S0 master)
-//   audio.cpp reference stream buffer (speaker PCM tap for AEC)
-//   → feed_task: mic+ref downsampled to 16kHz, interleaved [mic,ref], fed to AFE
-//   → AFE (AEC filter_length=1 + WakeNet): partial echo cancel, detect "Hi ESP"
+//   → feed_task: mic downsampled to 16kHz, fed directly to AFE (single channel)
+//   → AFE (WakeNet + AGC, no AEC): detect "Hi ESP"
 //   → fetch_task: AFE output fed to MultiNet for command recognition
+//
+// AEC is disabled because I2S0 DMA latency (~185ms at 22050 Hz) exceeds filter
+// coverage (4 × 32ms = 128ms), causing AEC to treat voice as echo and cancel it.
+// Single-mic M mode gives clean signal to WakeNet without AEC over-suppression.
 //
 // IMPORTANT: voice partition "model" must be flashed at 0x400000 with srmodels.bin.
 
@@ -57,7 +60,6 @@ static int                          s_mn_chunk  = 0;
 // State persists across iterations so WakeNet LSTM sees a continuous stream.
 typedef struct { uint32_t in_rate; uint64_t pos; } rs_state_t;
 static rs_state_t s_rs     = {0, 0};   // mic resampler state
-static rs_state_t s_rs_ref = {0, 0};   // reference resampler state
 
 static int resample_to_16k(rs_state_t *rs, const int16_t *in, int in_cnt,
                             uint32_t in_rate, int16_t *out, int out_max)
@@ -145,30 +147,24 @@ static esp_err_t mic_i2s_init(uint32_t rate)
 }
 
 // ── feed_task: Core 0 ─────────────────────────────────────────────────────────
-// Reads I2S1 mic + speaker reference, downsamples both to 16kHz,
-// builds interleaved [mic, ref] frame and feeds to AFE (MR = 2-channel mode).
+// Reads I2S1 mic, downsamples to 16kHz, feeds single-channel audio to AFE (M mode).
+// Reference stream from audio.cpp is not used (AEC disabled).
 static void feed_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(500));
 
     int max_i2s_frames = s_afe_feed_chunk * 48001 / VOICE_SR_HZ + 8;
 
-    uint32_t *stereo  = (uint32_t *)heap_caps_malloc(max_i2s_frames * 8,       MALLOC_CAP_SPIRAM);
-    int16_t  *mic_raw = (int16_t  *)heap_caps_malloc(max_i2s_frames * 2,       MALLOC_CAP_SPIRAM);
-    int16_t  *ref_raw = (int16_t  *)heap_caps_malloc(max_i2s_frames * 2,       MALLOC_CAP_SPIRAM);
-    int16_t  *mic_16k = (int16_t  *)heap_caps_malloc(s_afe_feed_chunk * 2,     MALLOC_CAP_SPIRAM);
-    int16_t  *ref_16k = (int16_t  *)heap_caps_malloc(s_afe_feed_chunk * 2,     MALLOC_CAP_SPIRAM);
-    // interleaved buffer: 2 channels (mic + ref) × feed_chunk samples
-    int16_t  *afe_in  = (int16_t  *)heap_caps_malloc(s_afe_feed_chunk * 2 * 2, MALLOC_CAP_SPIRAM);
+    uint32_t *stereo  = (uint32_t *)heap_caps_malloc(max_i2s_frames * 8,   MALLOC_CAP_SPIRAM);
+    int16_t  *mic_raw = (int16_t  *)heap_caps_malloc(max_i2s_frames * 2,   MALLOC_CAP_SPIRAM);
+    int16_t  *mic_16k = (int16_t  *)heap_caps_malloc(s_afe_feed_chunk * 2, MALLOC_CAP_SPIRAM);
 
-    if (!stereo || !mic_raw || !ref_raw || !mic_16k || !ref_16k || !afe_in) {
+    if (!stereo || !mic_raw || !mic_16k) {
         ESP_LOGE(TAG_VSR, "feed_task OOM");
-        heap_caps_free(stereo); heap_caps_free(mic_raw); heap_caps_free(ref_raw);
-        heap_caps_free(mic_16k); heap_caps_free(ref_16k); heap_caps_free(afe_in);
+        heap_caps_free(stereo); heap_caps_free(mic_raw); heap_caps_free(mic_16k);
         vTaskDelete(nullptr); return;
     }
 
-    StreamBufferHandle_t ref_stream = audio_get_ref_stream();
     uint32_t last_rms_log = 0;
     ESP_LOGI(TAG_VSR, "feed_task started — feed_chunk=%d", s_afe_feed_chunk);
 
@@ -194,34 +190,14 @@ static void feed_task(void *arg)
             mic_raw[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 
-        // Read AEC reference (speaker PCM, same rate as mic)
-        size_t ref_needed = (size_t)actual_frames * sizeof(int16_t);
-        size_t ref_got = 0;
-        if (ref_stream) {
-            ref_got = xStreamBufferReceive(ref_stream, ref_raw, ref_needed,
-                                           pdMS_TO_TICKS(10));
-        }
-        if (ref_got < ref_needed)
-            memset((uint8_t *)ref_raw + ref_got, 0, ref_needed - ref_got);
-
-        // Resample both channels from in_rate → 16kHz
-        int mic_cnt = resample_to_16k(&s_rs,     mic_raw, actual_frames, in_rate,
+        // Resample mic from in_rate → 16kHz
+        int mic_cnt = resample_to_16k(&s_rs, mic_raw, actual_frames, in_rate,
                                        mic_16k, s_afe_feed_chunk);
-        int ref_cnt = resample_to_16k(&s_rs_ref, ref_raw, actual_frames, in_rate,
-                                       ref_16k, s_afe_feed_chunk);
-
         if (mic_cnt < s_afe_feed_chunk)
             memset(mic_16k + mic_cnt, 0, (s_afe_feed_chunk - mic_cnt) * 2);
-        if (ref_cnt < s_afe_feed_chunk)
-            memset(ref_16k + ref_cnt, 0, (s_afe_feed_chunk - ref_cnt) * 2);
 
-        // Build interleaved frame: [mic[0], ref[0], mic[1], ref[1], ...]
-        for (int i = 0; i < s_afe_feed_chunk; i++) {
-            afe_in[i * 2 + 0] = mic_16k[i];
-            afe_in[i * 2 + 1] = ref_16k[i];
-        }
-
-        s_afe->feed(s_afe_data, afe_in);
+        // Feed single-channel mic audio to AFE (M mode)
+        s_afe->feed(s_afe_data, mic_16k);
 
         // Periodic mic-level diagnostic (every 5 s)
         {
@@ -369,7 +345,7 @@ int voice_sr_get_cmd(void)
 
 void voice_sr_init(void)
 {
-    ESP_LOGI(TAG_VSR, "Initializing voice recognition (AFE with AEC)...");
+    ESP_LOGI(TAG_VSR, "Initializing voice recognition (AFE M-mode, no AEC)...");
 
     // 1. Load models from the "model" SPIFFS partition
     srmodel_list_t *models = esp_srmodel_init("model");
@@ -389,18 +365,17 @@ void voice_sr_init(void)
     }
     ESP_LOGI(TAG_VSR, "WakeNet model: %s", wn_name);
 
-    // 3. Configure AFE: 1 mic + 1 ref (speaker reference for AEC).
-    // "MR" = Mic first, Reference second — interleaved [mic, ref] @ 16kHz.
-    // aec_filter_length=1 (32ms window) limits suppression depth to reduce voice cancellation.
-    // Previous attempts with longer filter suppressed 85% of signal including voice.
-    afe_config_t *afe_config = afe_config_init("MR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    // 3. Configure AFE: single mic (M mode), no AEC.
+    // AEC was disabled because I2S0 DMA latency (~185ms at 22050 Hz) exceeds
+    // aec_filter_length=4 coverage (128ms), causing AEC to misalign reference
+    // and cancel voice instead of echo. M mode gives clean signal to WakeNet.
+    // AFE_MODE_HIGH_PERF for maximum wake word detection accuracy (per XiaoZhi reference).
+    afe_config_t *afe_config = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
     if (!afe_config) {
         ESP_LOGE(TAG_VSR, "afe_config_init failed");
         return;
     }
-    afe_config->aec_init               = true;
-    afe_config->aec_filter_length      = 4;          // 4 × 32ms = 128ms — valid minimum; length=1 crashes AEC internals
-    afe_config->aec_nlp_level          = AEC_NLP_LEVEL_NORMAL;  // NLP_OFF (level 0 = disabled)
+    afe_config->aec_init               = false;
     afe_config->se_init                = false;
     afe_config->ns_init                = false;
     afe_config->vad_init               = false;
@@ -408,7 +383,7 @@ void voice_sr_init(void)
     afe_config->agc_mode               = AFE_AGC_MODE_WAKENET;
     afe_config->wakenet_init           = true;
     afe_config->wakenet_model_name     = wn_name;
-    afe_config->wakenet_mode           = DET_MODE_90;
+    afe_config->wakenet_mode           = DET_MODE_95;
     afe_config->memory_alloc_mode      = AFE_MEMORY_ALLOC_MORE_PSRAM;
     afe_config->afe_ringbuf_size       = 50;
     afe_config->afe_perferred_core     = 0;
@@ -485,5 +460,5 @@ void voice_sr_init(void)
     xTaskCreatePinnedToCoreWithCaps(fetch_task, "voice_fetch", 16384, nullptr, 5, nullptr, 1,
                                     MALLOC_CAP_SPIRAM);
 
-    ESP_LOGI(TAG_VSR, "Started — AFE+AEC active — say 'Hi ESP'");
+    ESP_LOGI(TAG_VSR, "Started — AFE M-mode (no AEC), HIGH_PERF — say 'Hi ESP'");
 }

@@ -141,9 +141,11 @@ static uint32_t g_restore_pos_sec  = 0;
 static uint32_t g_last_nvs_save_ms = 0;
 
 // ── EPD partial-refresh throttle ─────────────────────────────────────────────
-static uint32_t g_last_flush_ms = 0;
-static bool     g_silent_flush  = false;
-#define MIN_FLUSH_MS 160
+static uint32_t g_last_flush_ms    = 0;
+static bool     g_silent_flush     = false;
+static int      g_partial_count    = 0;    // partial refreshes since last full refresh
+#define MIN_FLUSH_MS                 160
+#define PARTIAL_FULL_REFRESH_INTERVAL 20   // force full refresh every N partials (datasheet: prevents ghosting/damage)
 
 // ── EOF auto-advance debounce ─────────────────────────────────────────────────
 static uint32_t g_eof_debounce = 0;
@@ -180,6 +182,9 @@ static void epd_flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map
     }
     if (!g_silent_flush) {
         epd->EPD_DisplayPart();
+        if (++g_partial_count >= PARTIAL_FULL_REFRESH_INTERVAL) {
+            g_full_refresh_pending = true;  // trigger full refresh in main_task
+        }
     }
     lv_display_flush_ready(d);
 }
@@ -293,6 +298,7 @@ static void refresh_ui()
 // ─────────────────────────────────────────────────────────────────────────────
 static void epd_full_refresh()
 {
+    g_partial_count = 0;          // reset partial counter after full refresh
     epd->EPD_LoadFullLut();
     g_silent_flush = true;
     lv_obj_invalidate(lv_screen_active());

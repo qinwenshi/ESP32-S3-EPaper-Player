@@ -27,7 +27,6 @@
 #include "esp_sleep.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "esp32s3/rom/tjpgd.h"
 
 #include "lvgl.h"
 
@@ -38,7 +37,7 @@
 #include "nvs_state.h"
 #include "buttons.h"
 #include "voice_sr.h"
-#include "default_cover.h"
+#include "sprite_anim.h"
 #include "snail_icon.h"
 
 static const char *TAG = "player";
@@ -85,44 +84,20 @@ static inline void delay_ms(uint32_t ms) {
 #define EPD_W 200
 #define EPD_H 200
 
-#define ART_SIZE   80
-#define ART_X      ((EPD_W - ART_SIZE) / 2)
-#define ART_Y       2
+// Sprite area — 96×104 (half scale of 192×208 source frames), centred
+#define SPRITE_DISP_W   96
+#define SPRITE_DISP_H  104
+#define SPRITE_X       ((EPD_W - SPRITE_DISP_W) / 2)   // = 52
+#define SPRITE_Y         2
 
-#define TITLE_Y    (ART_Y + ART_SIZE + 3)
-#define ARTIST_Y   (TITLE_Y + 16)
-#define PROG_Y     (ARTIST_Y + 12)
+#define TITLE_Y    (SPRITE_Y + SPRITE_DISP_H + 4)       // = 110
+#define ARTIST_Y   (TITLE_Y + 14)                       // = 124
+#define PROG_Y     (ARTIST_Y + 12)                      // = 136
 #define PROG_H     3
-#define SEP1_Y     (PROG_Y + PROG_H + 2)
-
-#define LYR0_Y     (SEP1_Y + 3)
-#define LYR1_Y     (LYR0_Y + 16)
-#define LYR2_Y     (LYR1_Y + 13)
-
-#define SEP2_Y     (LYR2_Y + 13)
-#define CTRL_Y     (SEP2_Y + 2)
+#define SEP_Y      (PROG_Y + PROG_H + 4)                // = 143
+#define CTRL_Y     (SEP_Y + 2)                          // = 145
 
 #define SNAIL_OBJ_Y   (PROG_Y + PROG_H/2 - SNAIL_H/2)
-
-// ── Cover art buffer (I1 format) ──────────────────────────────────────────────
-#define COVER_W      ART_SIZE
-#define COVER_H      ART_SIZE
-#define COVER_STRIDE ((COVER_W + 7) / 8)
-
-static uint8_t cover_buf[2 * 4 + COVER_STRIDE * COVER_H];
-
-static lv_image_dsc_t cover_dsc = {
-    .header = {
-        .magic  = LV_IMAGE_HEADER_MAGIC,
-        .cf     = LV_COLOR_FORMAT_I1,
-        .flags  = 0,
-        .w      = COVER_W,
-        .h      = COVER_H,
-        .stride = COVER_STRIDE,
-    },
-    .data_size = sizeof(cover_buf),
-    .data      = cover_buf,
-};
 
 // ── Hardware objects ──────────────────────────────────────────────────────────
 static epaper_driver_display *epd = nullptr;
@@ -132,14 +107,11 @@ static SemaphoreHandle_t  lvgl_mtx;
 static lv_display_t      *disp = nullptr;
 
 // ── UI widgets ───────────────────────────────────────────────────────────────
-static lv_obj_t *img_cover;
+static lv_obj_t *img_sprite;
 static lv_obj_t *lbl_title;
 static lv_obj_t *lbl_artist;
 static lv_obj_t *lbl_time;
 static lv_obj_t *bar_prog;
-static lv_obj_t *lbl_lyr0;
-static lv_obj_t *lbl_lyr1;
-static lv_obj_t *lbl_lyr2;
 static lv_obj_t *lbl_ctrl;
 static lv_obj_t *lbl_play_icon;
 static lv_obj_t *img_snail;
@@ -153,9 +125,6 @@ static int     cur_track  = 0;
 static bool    is_playing = false;
 static char    g_title[128]  = "No Track";
 static char    g_artist[64]  = "";
-static char    g_lyr[3][128] = {"","",""};
-static bool    g_cover_dirty = false;
-static uint32_t g_art_pos = 0, g_art_len = 0;
 static char    g_cur_file[256] = "";
 static uint32_t g_track_start_ms  = 0;
 static bool     g_meta_needs_save = false;
@@ -181,12 +150,6 @@ static uint32_t g_eof_debounce = 0;
 
 // ── Deep sleep ────────────────────────────────────────────────────────────────
 static uint32_t g_paused_since_ms = 0;
-
-// ── Cover decode task ─────────────────────────────────────────────────────────
-struct CoverDecodeReq { char path[256]; uint32_t file_pos; uint32_t file_len; };
-static CoverDecodeReq    g_cover_req;
-static SemaphoreHandle_t g_cover_sem   = nullptr;
-static volatile bool     g_cover_busy  = false;
 
 // ── Prescan task ──────────────────────────────────────────────────────────────
 static volatile bool g_prescan_allowed = false;
@@ -232,13 +195,6 @@ static void lvgl_tick_task(void*)
 // ─────────────────────────────────────────────────────────────────────────────
 // Build player screen
 // ─────────────────────────────────────────────────────────────────────────────
-static void load_default_cover()
-{
-    static_assert(sizeof(default_cover_data) == sizeof(cover_buf),
-                  "default_cover_data size must match cover_buf");
-    memcpy(cover_buf, default_cover_data, sizeof(cover_buf));
-}
-
 static void build_screen()
 {
     lv_obj_t *scr = lv_screen_active();
@@ -246,13 +202,11 @@ static void build_screen()
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
 
-    img_cover = lv_image_create(scr);
-    lv_obj_set_size(img_cover, ART_SIZE, ART_SIZE);
-    lv_obj_set_pos(img_cover, ART_X, ART_Y);
-    lv_obj_set_style_border_width(img_cover, 1, 0);
-    lv_obj_set_style_border_color(img_cover, lv_color_black(), 0);
-    load_default_cover();
-    lv_image_set_src(img_cover, &cover_dsc);
+    // ── Sprite widget (replaces static cover art) ──
+    img_sprite = lv_image_create(scr);
+    lv_obj_set_size(img_sprite, SPRITE_DISP_W, SPRITE_DISP_H);
+    lv_obj_set_pos(img_sprite, SPRITE_X, SPRITE_Y);
+    sprite_anim_init(img_sprite);
 
     lbl_title = lv_label_create(scr);
     lv_obj_set_width(lbl_title, EPD_W - 4);
@@ -285,56 +239,23 @@ static void build_screen()
     lv_obj_set_style_radius(bar_prog, 2, 0);
     lv_obj_set_style_radius(bar_prog, 2, LV_PART_INDICATOR);
 
-    lv_obj_t *sep1 = lv_obj_create(scr);
-    lv_obj_set_size(sep1, EPD_W, 1);
-    lv_obj_set_pos(sep1, 0, SEP1_Y);
-    lv_obj_set_style_bg_color(sep1, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(sep1, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(sep1, 0, 0);
-    lv_obj_clear_flag(sep1, LV_OBJ_FLAG_SCROLLABLE);
-
-    lbl_lyr0 = lv_label_create(scr);
-    lv_obj_set_width(lbl_lyr0, EPD_W - 4);
-    lv_obj_set_pos(lbl_lyr0, 2, LYR0_Y);
-    lv_obj_set_style_text_font(lbl_lyr0, &font_cubic11_14, 0);
-    lv_obj_set_style_bg_color(lbl_lyr0, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(lbl_lyr0, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_text_color(lbl_lyr0, lv_color_white(), 0);
-    lv_obj_set_style_pad_ver(lbl_lyr0, 1, 0);
-    lv_label_set_long_mode(lbl_lyr0, LV_LABEL_LONG_DOT);
-    lv_label_set_text(lbl_lyr0, "");
-
-    lbl_lyr1 = lv_label_create(scr);
-    lv_obj_set_width(lbl_lyr1, EPD_W - 4);
-    lv_obj_set_pos(lbl_lyr1, 2, LYR1_Y);
-    lv_obj_set_style_text_font(lbl_lyr1, &font_cubic11_11, 0);
-    lv_label_set_long_mode(lbl_lyr1, LV_LABEL_LONG_DOT);
-    lv_label_set_text(lbl_lyr1, "");
-
-    lbl_lyr2 = lv_label_create(scr);
-    lv_obj_set_width(lbl_lyr2, EPD_W - 4);
-    lv_obj_set_pos(lbl_lyr2, 2, LYR2_Y);
-    lv_obj_set_style_text_font(lbl_lyr2, &font_cubic11_11, 0);
-    lv_label_set_long_mode(lbl_lyr2, LV_LABEL_LONG_DOT);
-    lv_label_set_text(lbl_lyr2, "");
-
     img_snail = lv_image_create(scr);
     lv_image_set_src(img_snail, &snail_dsc);
     lv_obj_set_pos(img_snail, 2, SNAIL_OBJ_Y);
 
-    lv_obj_t *sep2 = lv_obj_create(scr);
-    lv_obj_set_size(sep2, EPD_W, 1);
-    lv_obj_set_pos(sep2, 0, SEP2_Y);
-    lv_obj_set_style_bg_color(sep2, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(sep2, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(sep2, 0, 0);
-    lv_obj_clear_flag(sep2, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *sep = lv_obj_create(scr);
+    lv_obj_set_size(sep, EPD_W, 1);
+    lv_obj_set_pos(sep, 0, SEP_Y);
+    lv_obj_set_style_bg_color(sep, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sep, 0, 0);
+    lv_obj_clear_flag(sep, LV_OBJ_FLAG_SCROLLABLE);
 
     lbl_ctrl = lv_label_create(scr);
     lv_obj_set_width(lbl_ctrl, EPD_W - 22);
     lv_obj_set_pos(lbl_ctrl, 2, CTRL_Y);
     lv_obj_set_style_text_font(lbl_ctrl, &font_cubic11_11, 0);
-    lv_label_set_text(lbl_ctrl, "BOOT:暂停  PWR:下一首\nBOOT长按:上一首");
+    lv_label_set_text(lbl_ctrl, "BOOT:暂停  PWR:下一首\nPWR长按:上一首");
 
     lbl_play_icon = lv_label_create(scr);
     lv_obj_set_width(lbl_play_icon, 18);
@@ -350,9 +271,6 @@ static void refresh_ui()
 {
     lv_label_set_text(lbl_title,  g_title[0] ? g_title : "No Track");
     lv_label_set_text(lbl_artist, g_artist);
-    lv_label_set_text(lbl_lyr0,   g_lyr[0]);
-    lv_label_set_text(lbl_lyr1,   g_lyr[1]);
-    lv_label_set_text(lbl_lyr2,   g_lyr[2]);
 
     uint32_t cur = audio_get_current_time();
     uint32_t tot = audio_get_duration();
@@ -463,51 +381,6 @@ static bool parse_id3_text(const char *mp3_path,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// JPEG → Floyd-Steinberg dither → cover_buf (I1 format)
-// ─────────────────────────────────────────────────────────────────────────────
-static uint8_t jpegWork[3100];
-
-struct JpegCtx {
-    FILE    *file;
-    uint32_t remaining;
-    uint8_t *gray;
-    int      outW, outH;
-};
-
-static UINT jpeg_input(JDEC *jd, BYTE *buf, UINT len)
-{
-    JpegCtx *ctx = (JpegCtx*)jd->device;
-    if (len > ctx->remaining) len = ctx->remaining;
-    if (buf) fread(buf, 1, len, ctx->file);
-    else     fseek(ctx->file, len, SEEK_CUR);
-    ctx->remaining -= len;
-    return len;
-}
-
-static UINT jpeg_output(JDEC *jd, void *bmp, JRECT *rect)
-{
-    JpegCtx *ctx = (JpegCtx*)jd->device;
-    uint8_t *src = (uint8_t*)bmp;
-    int sw = rect->right - rect->left + 1;
-    int sh = rect->bottom - rect->top + 1;
-    for (int r = 0; r < sh; r++) {
-        int dy = rect->top + r;
-        if (dy >= ctx->outH) continue;
-        for (int c = 0; c < sw; c++) {
-            int dx = rect->left + c;
-            if (dx >= ctx->outW) continue;
-            uint8_t R = src[(r*sw+c)*3+0];
-            uint8_t G = src[(r*sw+c)*3+1];
-            uint8_t B = src[(r*sw+c)*3+2];
-            ctx->gray[dy * ctx->outW + dx] = (R*77 + G*150 + B*29) >> 8;
-        }
-    }
-    return 1;
-}
-
-static void decode_cover(const char *path, uint32_t file_pos, uint32_t file_len);
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Meta prescan task
 // ─────────────────────────────────────────────────────────────────────────────
 static void meta_prescan_task(void *)
@@ -566,108 +439,6 @@ static void meta_prescan_task(void *)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cover decode
-// ─────────────────────────────────────────────────────────────────────────────
-static void decode_cover(const char *path, uint32_t file_pos, uint32_t file_len)
-{
-    uint8_t *gray = (uint8_t*)heap_caps_malloc(COVER_W * COVER_H, MALLOC_CAP_SPIRAM);
-    if (!gray) return;
-    memset(gray, 128, COVER_W * COVER_H);
-
-    FILE *f = fopen(path, "rb");
-    if (!f) { heap_caps_free(gray); return; }
-
-    fseek(f, file_pos, SEEK_SET);
-    uint32_t scanned = 0;
-    bool found = false;
-    while (scanned + 1 < file_len) {
-        uint8_t b; fread(&b, 1, 1, f); scanned++;
-        if (b == 0xFF) {
-            uint8_t nb; fread(&nb, 1, 1, f);
-            if (nb == 0xD8) {
-                fseek(f, -2, SEEK_CUR); found = true; break;
-            } else {
-                fseek(f, -1, SEEK_CUR);
-            }
-        }
-    }
-
-    if (found) {
-        JpegCtx ctx = { f, file_len - scanned, gray, COVER_W, COVER_H };
-        JDEC jd;
-        if (jd_prepare(&jd, jpeg_input, jpegWork, sizeof(jpegWork), &ctx) == JDR_OK) {
-            uint8_t scale = 0;
-            while (scale < 3 && (jd.width >> scale) > (uint16_t)COVER_W) scale++;
-            jd_decomp(&jd, jpeg_output, scale);
-        }
-    }
-    fclose(f);
-
-    int16_t *err = (int16_t*)heap_caps_malloc(COVER_W * COVER_H * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (!err) { heap_caps_free(gray); return; }
-    for (int i = 0; i < COVER_W * COVER_H; i++) err[i] = gray[i];
-
-    lv_color32_t *pal = (lv_color32_t*)cover_buf;
-    pal[0] = (lv_color32_t){.blue=0,   .green=0,   .red=0,   .alpha=255};
-    pal[1] = (lv_color32_t){.blue=255, .green=255, .red=255, .alpha=255};
-    uint8_t *bits = cover_buf + 2 * sizeof(lv_color32_t);
-    memset(bits, 0, COVER_STRIDE * COVER_H);
-
-    for (int y = 0; y < COVER_H; y++) {
-        for (int x = 0; x < COVER_W; x++) {
-            int16_t old = err[y*COVER_W + x];
-            int16_t clamp = (old < 0) ? 0 : (old > 255) ? 255 : old;
-            uint8_t bit  = (clamp >= 128) ? 1 : 0;
-            int16_t qerr = clamp - (bit ? 255 : 0);
-            if (bit) bits[y*COVER_STRIDE + (x>>3)] |= (0x80 >> (x&7));
-            if (x+1 < COVER_W) { err[y*COVER_W+x+1] += qerr*7/16; }
-            if (y+1 < COVER_H) {
-                if (x > 0)         { err[(y+1)*COVER_W+x-1] += qerr*3/16; }
-                                     err[(y+1)*COVER_W+x]   += qerr*5/16;
-                if (x+1 < COVER_W) { err[(y+1)*COVER_W+x+1] += qerr*1/16; }
-            }
-        }
-    }
-    heap_caps_free(err);
-    heap_caps_free(gray);
-
-    if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(500)) == pdTRUE) {
-        g_cover_dirty = true;
-        lv_image_set_src(img_cover, &cover_dsc);
-        xSemaphoreGive(lvgl_mtx);
-    }
-
-    TrackMeta meta = {};
-    strncpy(meta.title,  g_title,  sizeof(meta.title)-1);
-    strncpy(meta.artist, g_artist, sizeof(meta.artist)-1);
-    meta.has_cover = true;
-    // pack cover bits into meta.cover_data
-    lv_color32_t *mpal = (lv_color32_t*)meta.cover_data;
-    mpal[0] = (lv_color32_t){.blue=0,   .green=0,   .red=0,   .alpha=255};
-    mpal[1] = (lv_color32_t){.blue=255, .green=255, .red=255, .alpha=255};
-    memcpy(meta.cover_data + 8, bits, COVER_STRIDE * COVER_H);
-    sdcard_save_meta(g_cur_file, meta);
-
-    g_meta_needs_save = false;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Cover decode task (Core 0)
-// ─────────────────────────────────────────────────────────────────────────────
-static void cover_decode_task(void *)
-{
-    for (;;) {
-        xSemaphoreTake(g_cover_sem, portMAX_DELAY);
-        CoverDecodeReq req;
-        memcpy(&req, &g_cover_req, sizeof(req));
-        g_cover_busy = true;
-        if (req.file_len > 0 && req.path[0])
-            decode_cover(req.path, req.file_pos, req.file_len);
-        g_cover_busy = false;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Audio callbacks
 // ─────────────────────────────────────────────────────────────────────────────
 static void on_meta(const char *key, const char *value)
@@ -688,18 +459,12 @@ static void on_meta(const char *key, const char *value)
         g_meta_needs_save = true;
     } else if (strncmp(key, "SampleRate: ", 12) == 0) {
         uint32_t sr = (uint32_t)atoi(value);
-        if (sr == 44100 || sr == 48000 || sr == 32000) {
+        if (sr >= 8000 && sr <= 96000) {
             codec_set_sample_rate(sr);
             voice_sr_set_input_rate(sr);
             ESP_LOGI(TAG, "Sample rate -> %u Hz", sr);
         }
     }
-}
-
-static void on_image(uint32_t file_offset, uint32_t byte_len)
-{
-    g_art_pos = file_offset;
-    g_art_len = byte_len;
 }
 
 static void on_eof(void)
@@ -710,7 +475,8 @@ static void on_eof(void)
 // ─────────────────────────────────────────────────────────────────────────────
 // play_track
 // ─────────────────────────────────────────────────────────────────────────────
-static void play_track(int idx)
+// direction: +1 = forward/next, -1 = backward/prev, 0 = restart/auto
+static void play_track(int idx, int direction = 0)
 {
     if (tracks.empty()) return;
     idx = ((idx % (int)tracks.size()) + (int)tracks.size()) % (int)tracks.size();
@@ -724,14 +490,23 @@ static void play_track(int idx)
     g_audio_eof       = false;
     g_prescan_allowed = false;
 
+    // Sprite: establish IDLE as the base state, then show direction animation
+    if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+        sprite_anim_set_state(SPRITE_STATE_IDLE, false);  // set base = idle
+        if (direction > 0)
+            sprite_anim_set_state(SPRITE_STATE_RUNNING_RIGHT, true);
+        else if (direction < 0)
+            sprite_anim_set_state(SPRITE_STATE_RUNNING_LEFT, true);
+        else
+            sprite_anim_set_state(SPRITE_STATE_RUNNING, true);
+        xSemaphoreGive(lvgl_mtx);
+    }
+
     const char *path = tracks[idx].c_str();
     strncpy(g_cur_file, path, sizeof(g_cur_file)-1);
 
     memset(g_title,  0, sizeof(g_title));
     memset(g_artist, 0, sizeof(g_artist));
-    memset(g_lyr,    0, sizeof(g_lyr));
-    g_art_pos = g_art_len = 0;
-    g_cover_dirty = false;
     g_meta_needs_save = false;
     g_track_start_ms  = millis();
 
@@ -750,15 +525,11 @@ static void play_track(int idx)
 
     ESP_LOGI("player", "play_track: free internal=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    // Load cached metadata
+    // Load cached metadata (title/artist only — no cover art)
     TrackMeta meta = {};
-    bool has_cached_cover = sdcard_load_meta(path, meta);
-    if (has_cached_cover || strlen(meta.title) > 0) {
+    if (sdcard_load_meta(path, meta) || strlen(meta.title) > 0) {
         strncpy(g_title,  meta.title,  sizeof(g_title)-1);
         strncpy(g_artist, meta.artist, sizeof(g_artist)-1);
-        if (has_cached_cover) {
-            memcpy(cover_buf, meta.cover_data, sizeof(cover_buf));
-        }
     }
 
     audio_play(path);
@@ -766,12 +537,6 @@ static void play_track(int idx)
     if (!g_display_fresh) {
         if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(500)) == pdTRUE) {
             refresh_ui();
-            if (has_cached_cover) {
-                lv_image_set_src(img_cover, &cover_dsc);
-            } else {
-                load_default_cover();
-                lv_image_set_src(img_cover, &cover_dsc);
-            }
             xSemaphoreGive(lvgl_mtx);
         }
         g_full_refresh_pending = true;
@@ -807,8 +572,6 @@ static void enter_deep_sleep(void)
 static void main_task(void *)
 {
     static uint32_t last_ui_tick   = 0;
-    static uint32_t last_art_check = 0;
-    static bool     art_pending    = false;
     static bool     s_was_playing  = true;
 
     for (;;) {
@@ -832,6 +595,11 @@ static void main_task(void *)
                         }
                         delay_ms(300);
                     }
+                    // Sprite: wave to indicate voice mode
+                    if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        sprite_anim_set_state(SPRITE_STATE_WAVING, true);
+                        xSemaphoreGive(lvgl_mtx);
+                    }
                     voice_sr_start_listen();
                     ESP_LOGI(TAG, "[VOICE] Long press — speak command now");
                 } else if (held > 50) {
@@ -841,6 +609,8 @@ static void main_task(void *)
                     if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
                         lv_label_set_text(lbl_play_icon,
                             is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+                        sprite_anim_set_state(
+                            is_playing ? SPRITE_STATE_IDLE : SPRITE_STATE_WAITING, false);
                         xSemaphoreGive(lvgl_mtx);
                     }
                 }
@@ -858,6 +628,7 @@ static void main_task(void *)
                 g_voice_was_paused = false;
                 if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
                     lv_label_set_text(lbl_play_icon, LV_SYMBOL_PAUSE);
+                    sprite_anim_set_state(SPRITE_STATE_WAITING, false);
                     xSemaphoreGive(lvgl_mtx);
                 }
             }
@@ -870,9 +641,9 @@ static void main_task(void *)
             if (now - g_last_track_btn_ms > 500) {
                 g_last_track_btn_ms = now;
                 if (held > 800) {
-                    play_track(cur_track - 1);
+                    play_track(cur_track - 1, -1);
                 } else {
-                    play_track(cur_track + 1);
+                    play_track(cur_track + 1, +1);
                 }
             }
         }
@@ -883,14 +654,19 @@ static void main_task(void *)
             if (vcmd != VOICE_CMD_NONE) {
                 ESP_LOGI(TAG, "[VOICE] Executing command %d", vcmd);
                 switch (vcmd) {
-                    case VOICE_CMD_NEXT:    play_track(cur_track + 1); break;
-                    case VOICE_CMD_PREV:    play_track(cur_track - 1); break;
+                    case VOICE_CMD_NEXT:
+                        play_track(cur_track + 1, +1);
+                        break;
+                    case VOICE_CMD_PREV:
+                        play_track(cur_track - 1, -1);
+                        break;
                     case VOICE_CMD_PAUSE:
                         if (is_playing) {
                             is_playing = false; audio_pause_resume();
                             g_prescan_allowed = true;
                             if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
                                 lv_label_set_text(lbl_play_icon, LV_SYMBOL_PAUSE);
+                                sprite_anim_set_state(SPRITE_STATE_WAITING, false);
                                 xSemaphoreGive(lvgl_mtx);
                             }
                         }
@@ -901,12 +677,17 @@ static void main_task(void *)
                             g_prescan_allowed = false;
                             if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
                                 lv_label_set_text(lbl_play_icon, LV_SYMBOL_PLAY);
+                                sprite_anim_set_state(SPRITE_STATE_IDLE, false);
                                 xSemaphoreGive(lvgl_mtx);
                             }
                         }
                         break;
                     case VOICE_CMD_VOL_UP:
                         codec_set_volume(std::min(100, (int)codec_get_volume() + 10));
+                        if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            sprite_anim_set_state(SPRITE_STATE_JUMPING, true);
+                            xSemaphoreGive(lvgl_mtx);
+                        }
                         break;
                     case VOICE_CMD_VOL_DOWN:
                         codec_set_volume(std::max(0, (int)codec_get_volume() - 10));
@@ -948,27 +729,10 @@ static void main_task(void *)
             if (millis() - g_eof_debounce > 800) {
                 g_eof_debounce = 0;
                 g_audio_eof    = false;
-                play_track(cur_track + 1);
+                play_track(cur_track + 1, 0);  // direction=0 → 'running' animation
             }
         } else {
             g_eof_debounce = 0;
-        }
-
-        // ── Cover art decode ──
-        if (!art_pending && g_art_len > 0 && g_cur_file[0]) {
-            art_pending    = true;
-            last_art_check = millis();
-        }
-        if (art_pending && (millis() - last_art_check > 200)) {
-            art_pending = false;
-            uint32_t pos = g_art_pos, len = g_art_len;
-            g_art_pos = g_art_len = 0;
-            if (len > 0 && !g_cover_busy) {
-                strncpy(g_cover_req.path, g_cur_file, sizeof(g_cover_req.path)-1);
-                g_cover_req.file_pos = pos;
-                g_cover_req.file_len = len;
-                xSemaphoreGive(g_cover_sem);
-            }
         }
 
         // ── Save metadata cache ──
@@ -982,12 +746,13 @@ static void main_task(void *)
             sdcard_save_meta(g_cur_file, meta);
         }
 
-        // ── Periodic UI refresh ──
+        // ── Periodic UI refresh + sprite tick (every 300 ms) ──
         uint32_t now = millis();
-        if (now - last_ui_tick >= 1000) {
+        if (now - last_ui_tick >= 300) {
             last_ui_tick = now;
             if (xSemaphoreTake(lvgl_mtx, 0) == pdTRUE) {
-                refresh_ui();
+                sprite_anim_tick();
+                if ((now / 300) % 4 == 0) refresh_ui();  // full text refresh every ~1.2 s
                 xSemaphoreGive(lvgl_mtx);
             }
         }
@@ -1060,16 +825,13 @@ static void setup_task(void *)
     if (saved_track < 0 || saved_track >= (int)tracks.size()) saved_track = 0;
 
     // ── Pre-load title/artist for boot render ──
-    bool boot_has_cover = false;
     if (!tracks.empty()) {
         const char *boot_path = tracks[saved_track].c_str();
         strncpy(g_cur_file, boot_path, sizeof(g_cur_file)-1);
         TrackMeta meta = {};
-        boot_has_cover = sdcard_load_meta(boot_path, meta);
-        if (boot_has_cover || strlen(meta.title) > 0) {
+        if (sdcard_load_meta(boot_path, meta) || strlen(meta.title) > 0) {
             strncpy(g_title,  meta.title,  sizeof(g_title)-1);
             strncpy(g_artist, meta.artist, sizeof(g_artist)-1);
-            if (boot_has_cover) memcpy(cover_buf, meta.cover_data, sizeof(cover_buf));
         }
         if (!g_title[0]) {
             std::string fname(boot_path);
@@ -1093,9 +855,6 @@ static void setup_task(void *)
     lv_init();
     lvgl_mtx = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(lvgl_tick_task,    "lv_tick",  1024,  nullptr, 5, nullptr, 0);
-    g_cover_sem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCoreWithCaps(cover_decode_task, "cover_dec", 16384, nullptr, 2, nullptr, 0,
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     xTaskCreatePinnedToCoreWithCaps(meta_prescan_task, "prescan",   8192,  nullptr, 1, nullptr, 0,
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
@@ -1110,7 +869,8 @@ static void setup_task(void *)
 
     if (xSemaphoreTake(lvgl_mtx, portMAX_DELAY) == pdTRUE) {
         refresh_ui();
-        if (boot_has_cover) lv_image_set_src(img_cover, &cover_dsc);
+        // Start in review (loading) state; play_track() will transition to idle/waiting
+        sprite_anim_set_state(tracks.empty() ? SPRITE_STATE_FAILED : SPRITE_STATE_REVIEW, false);
         xSemaphoreGive(lvgl_mtx);
     }
 
@@ -1130,7 +890,7 @@ static void setup_task(void *)
 
     // ── Codec + audio ──
     audio_init(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
-    audio_set_callbacks(on_meta, on_image, on_eof);
+    audio_set_callbacks(on_meta, nullptr, on_eof);
     delay_ms(10);
 
     if (!codec_init(CODEC_SDA, CODEC_SCL, 400000)) {
@@ -1162,6 +922,7 @@ static void setup_task(void *)
     } else {
         if (xSemaphoreTake(lvgl_mtx, portMAX_DELAY) == pdTRUE) {
             lv_label_set_text(lbl_title, "SD空/无MP3");
+            sprite_anim_set_state(SPRITE_STATE_FAILED, false);
             xSemaphoreGive(lvgl_mtx);
         }
     }

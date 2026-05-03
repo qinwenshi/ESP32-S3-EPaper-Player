@@ -264,12 +264,26 @@ static void audio_task(void *arg)
         s_current_hz      = 44100;
 
         int buf_fill = 0;
+        bool was_paused = false; // tracks pause transition to flush DMA once
 
         while (!s_stop_req) {
             if (s_pause_req) {
+                if (!was_paused) {
+                    // I2S DMA is a circular ring (8 desc × 512 frames × 8 bytes = 32 KB).
+                    // Without flushing, DMA loops the last audio frames endlessly.
+                    // Write 4 silence frames to fill the entire ring with zeros.
+                    const size_t sil_bytes = (size_t)(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int32_t));
+                    memset(i2s_buf, 0, sil_bytes);
+                    size_t written = 0;
+                    for (int k = 0; k < 4 && !s_stop_req; k++) {
+                        i2s_channel_write(s_i2s_tx, i2s_buf, sil_bytes, &written, pdMS_TO_TICKS(50));
+                    }
+                    was_paused = true;
+                }
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
             }
+            was_paused = false;
 
             // Handle pending seek request
             uint32_t seek_to = s_seek_to;
@@ -310,6 +324,14 @@ static void audio_task(void *arg)
                 if ((uint32_t)info.hz != s_current_hz) {
                     audio_i2s_set_rate((uint32_t)info.hz);
                     s_current_hz = (uint32_t)info.hz;
+                    // Notify app of rate change so voice SR resampler tracks it.
+                    // This fires on_meta_data("SampleRate: ", ...) in app_main.cpp
+                    // which calls voice_sr_set_input_rate() and codec_set_sample_rate().
+                    if (s_meta_cb) {
+                        char sr_str[12];
+                        snprintf(sr_str, sizeof(sr_str), "%" PRIu32, (uint32_t)info.hz);
+                        s_meta_cb("SampleRate: ", sr_str);
+                    }
                 }
 
                 // Convert 16-bit stereo/mono → 32-bit stereo

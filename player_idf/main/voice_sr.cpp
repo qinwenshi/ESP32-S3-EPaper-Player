@@ -2,12 +2,12 @@
 // Wake word : "Hi ESP"  (wn9_hiesp — official Espressif model)
 // Commands  : English phrases (mn5q8_en)
 //
-// Architecture (with AEC):
+// Architecture (MR = 1 mic + 1 ref, AEC with minimal filter to reduce over-suppression):
 //   I2S1 slave mic (32-bit slot, BCLK/WS from I2S0 master)
-//   audio.cpp reference stream buffer (speaker PCM tap)
-//   → feed_task: mic + ref downsampled to 16kHz, interleaved [mic,ref], fed to AFE
-//   → AFE (AEC + WakeNet): cancels speaker echo, detects "Hi ESP"
-//   → fetch_task: AFE output audio fed to MultiNet for command recognition
+//   audio.cpp reference stream buffer (speaker PCM tap for AEC)
+//   → feed_task: mic+ref downsampled to 16kHz, interleaved [mic,ref], fed to AFE
+//   → AFE (AEC filter_length=1 + WakeNet): partial echo cancel, detect "Hi ESP"
+//   → fetch_task: AFE output fed to MultiNet for command recognition
 //
 // IMPORTANT: voice partition "model" must be flashed at 0x400000 with srmodels.bin.
 
@@ -56,8 +56,8 @@ static int                          s_mn_chunk  = 0;
 // One for mic channel, one for reference channel.
 // State persists across iterations so WakeNet LSTM sees a continuous stream.
 typedef struct { uint32_t in_rate; uint64_t pos; } rs_state_t;
-static rs_state_t s_rs     = {0, 0};   // mic
-static rs_state_t s_rs_ref = {0, 0};   // reference
+static rs_state_t s_rs     = {0, 0};   // mic resampler state
+static rs_state_t s_rs_ref = {0, 0};   // reference resampler state
 
 static int resample_to_16k(rs_state_t *rs, const int16_t *in, int in_cnt,
                             uint32_t in_rate, int16_t *out, int out_max)
@@ -67,20 +67,39 @@ static int resample_to_16k(rs_state_t *rs, const int16_t *in, int in_cnt,
         rs->pos     = 0;
     }
 
-    uint32_t half_rate = in_rate / 2;   // e.g. 22050 for 44100
     int n = 0;
+    uint32_t half_rate = in_rate / 2;
 
-    while (n < out_max) {
-        uint32_t i0 = (uint32_t)(rs->pos / VOICE_SR_HZ);
-        if ((int)(i0 * 2 + 3) >= in_cnt) break;
+    if (half_rate >= VOICE_SR_HZ) {
+        // in_rate >= 32000 Hz: average adjacent pairs first (anti-alias), then interpolate.
+        // e.g. 44100 → pairs averaged to 22050 domain → linear interp to 16000.
+        // pos advances by half_rate per output sample; i0 is index into the averaged domain.
+        while (n < out_max) {
+            uint32_t i0 = (uint32_t)(rs->pos / VOICE_SR_HZ);
+            if ((int)(i0 * 2 + 3) >= in_cnt) break;
 
-        int s0 = ((int)in[i0*2 + 0] + in[i0*2 + 1]) >> 1;
-        int s1 = ((int)in[i0*2 + 2] + in[i0*2 + 3]) >> 1;
+            int s0 = ((int)in[i0*2 + 0] + in[i0*2 + 1]) >> 1;
+            int s1 = ((int)in[i0*2 + 2] + in[i0*2 + 3]) >> 1;
 
-        int f  = (int)((rs->pos % VOICE_SR_HZ) * 256 / VOICE_SR_HZ);
-        out[n] = (int16_t)(((256 - f) * s0 + f * s1) >> 8);
-        ++n;
-        rs->pos += half_rate;
+            int f  = (int)((rs->pos % VOICE_SR_HZ) * 256 / VOICE_SR_HZ);
+            out[n] = (int16_t)(((256 - f) * s0 + f * s1) >> 8);
+            ++n;
+            rs->pos += half_rate;
+        }
+    } else {
+        // in_rate < 32000 Hz (e.g. 22050, 16000): direct linear interpolation.
+        // Do NOT pair-average — that would halve bandwidth to in_rate/2 (e.g. 5512 Hz),
+        // cutting the 5–8 kHz range where 'S' / 'sh' consonants live and breaking WakeNet.
+        // pos advances by in_rate per output sample; i0 indexes directly into in[].
+        while (n < out_max) {
+            uint32_t i0 = (uint32_t)(rs->pos / VOICE_SR_HZ);
+            if ((int)(i0 + 1) >= in_cnt) break;
+
+            int f  = (int)((rs->pos % VOICE_SR_HZ) * 256 / VOICE_SR_HZ);
+            out[n] = (int16_t)(((256 - f) * (int)in[i0] + f * (int)in[i0 + 1]) >> 8);
+            ++n;
+            rs->pos += in_rate;
+        }
     }
 
     uint32_t i0_last = (uint32_t)(rs->pos / VOICE_SR_HZ);
@@ -127,12 +146,11 @@ static esp_err_t mic_i2s_init(uint32_t rate)
 
 // ── feed_task: Core 0 ─────────────────────────────────────────────────────────
 // Reads I2S1 mic + speaker reference, downsamples both to 16kHz,
-// builds interleaved [mic, ref] frame and feeds to AFE.
+// builds interleaved [mic, ref] frame and feeds to AFE (MR = 2-channel mode).
 static void feed_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // Allocate enough input frames for one AFE feed chunk at the highest rate
     int max_i2s_frames = s_afe_feed_chunk * 48001 / VOICE_SR_HZ + 8;
 
     uint32_t *stereo  = (uint32_t *)heap_caps_malloc(max_i2s_frames * 8,       MALLOC_CAP_SPIRAM);
@@ -140,7 +158,7 @@ static void feed_task(void *arg)
     int16_t  *ref_raw = (int16_t  *)heap_caps_malloc(max_i2s_frames * 2,       MALLOC_CAP_SPIRAM);
     int16_t  *mic_16k = (int16_t  *)heap_caps_malloc(s_afe_feed_chunk * 2,     MALLOC_CAP_SPIRAM);
     int16_t  *ref_16k = (int16_t  *)heap_caps_malloc(s_afe_feed_chunk * 2,     MALLOC_CAP_SPIRAM);
-    // interleaved buffer: total_ch_num * feed_chunk — 2 channels (mic + ref)
+    // interleaved buffer: 2 channels (mic + ref) × feed_chunk samples
     int16_t  *afe_in  = (int16_t  *)heap_caps_malloc(s_afe_feed_chunk * 2 * 2, MALLOC_CAP_SPIRAM);
 
     if (!stereo || !mic_raw || !ref_raw || !mic_16k || !ref_16k || !afe_in) {
@@ -152,7 +170,6 @@ static void feed_task(void *arg)
 
     StreamBufferHandle_t ref_stream = audio_get_ref_stream();
     uint32_t last_rms_log = 0;
-
     ESP_LOGI(TAG_VSR, "feed_task started — feed_chunk=%d", s_afe_feed_chunk);
 
     for (;;) {
@@ -177,14 +194,13 @@ static void feed_task(void *arg)
             mic_raw[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
         }
 
-        // Read reference from stream buffer (speaker PCM, same rate)
+        // Read AEC reference (speaker PCM, same rate as mic)
         size_t ref_needed = (size_t)actual_frames * sizeof(int16_t);
         size_t ref_got = 0;
         if (ref_stream) {
             ref_got = xStreamBufferReceive(ref_stream, ref_raw, ref_needed,
                                            pdMS_TO_TICKS(10));
         }
-        // Zero-pad reference if not enough data (music paused or not started)
         if (ref_got < ref_needed)
             memset((uint8_t *)ref_raw + ref_got, 0, ref_needed - ref_got);
 
@@ -365,27 +381,41 @@ void voice_sr_init(void)
     for (int i = 0; i < models->num; i++)
         ESP_LOGI(TAG_VSR, "  [%d] %s", i, models->model_name[i]);
 
-    // 2. Configure AFE: 1 mic + 1 ref (speaker reference for AEC), WakeNet integrated
-    // "MR" = Mic first, Reference second — interleaved [mic, ref] @ 16kHz
+    // 2. Explicitly find the WakeNet model name from partition
+    char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "hiesp");
+    if (!wn_name) {
+        ESP_LOGE(TAG_VSR, "wn9_hiesp not found in models partition — cannot init WakeNet");
+        return;
+    }
+    ESP_LOGI(TAG_VSR, "WakeNet model: %s", wn_name);
+
+    // 3. Configure AFE: 1 mic + 1 ref (speaker reference for AEC).
+    // "MR" = Mic first, Reference second — interleaved [mic, ref] @ 16kHz.
+    // aec_filter_length=1 (32ms window) limits suppression depth to reduce voice cancellation.
+    // Previous attempts with longer filter suppressed 85% of signal including voice.
     afe_config_t *afe_config = afe_config_init("MR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (!afe_config) {
         ESP_LOGE(TAG_VSR, "afe_config_init failed");
         return;
     }
     afe_config->aec_init               = true;
-    afe_config->aec_filter_length      = 4;         // 4 × 32ms = 128ms — covers DMA delay
-    afe_config->se_init                = false;      // no beamforming (single mic)
-    afe_config->ns_init                = false;      // skip NS to save memory
-    afe_config->vad_init               = false;      // WakeNet handles VAD implicitly
-    afe_config->agc_init               = true;       // let AFE normalise levels
+    afe_config->aec_filter_length      = 4;          // 4 × 32ms = 128ms — valid minimum; length=1 crashes AEC internals
+    afe_config->aec_nlp_level          = AEC_NLP_LEVEL_NORMAL;  // NLP_OFF (level 0 = disabled)
+    afe_config->se_init                = false;
+    afe_config->ns_init                = false;
+    afe_config->vad_init               = false;
+    afe_config->agc_init               = true;
     afe_config->agc_mode               = AFE_AGC_MODE_WAKENET;
     afe_config->wakenet_init           = true;
-    afe_config->wakenet_mode           = DET_MODE_95;
+    afe_config->wakenet_model_name     = wn_name;
+    afe_config->wakenet_mode           = DET_MODE_90;
     afe_config->memory_alloc_mode      = AFE_MEMORY_ALLOC_MORE_PSRAM;
     afe_config->afe_ringbuf_size       = 50;
     afe_config->afe_perferred_core     = 0;
     afe_config->afe_perferred_priority = 5;
     afe_config = afe_config_check(afe_config);
+    ESP_LOGI(TAG_VSR, "AFE wakenet_model_name after check: %s",
+             afe_config->wakenet_model_name ? afe_config->wakenet_model_name : "NULL");
 
     s_afe = esp_afe_handle_from_config(afe_config);
     if (!s_afe) { ESP_LOGE(TAG_VSR, "esp_afe_handle_from_config failed"); return; }
@@ -398,7 +428,7 @@ void voice_sr_init(void)
 
     s_afe->print_pipeline(s_afe_data);
 
-    // 3. Find MultiNet model
+    // 4. Find MultiNet model
     char *mn_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_ENGLISH);
     if (!mn_name) { ESP_LOGE(TAG_VSR, "mn5q8_en not found in models"); return; }
     ESP_LOGI(TAG_VSR, "MultiNet: %s", mn_name);
@@ -410,7 +440,7 @@ void voice_sr_init(void)
     s_mn_chunk = s_multinet->get_samp_chunksize(s_mn_data);
     ESP_LOGI(TAG_VSR, "MultiNet chunk=%d samples", s_mn_chunk);
 
-    // 4. Register voice commands
+    // 5. Register voice commands
     esp_mn_commands_alloc(s_multinet, s_mn_data);
     esp_mn_commands_add(VOICE_CMD_NEXT,     "change song");
     esp_mn_commands_add(VOICE_CMD_NEXT,     "skip song");
@@ -432,13 +462,13 @@ void voice_sr_init(void)
                 mn_err->phrases[i]->command_id, mn_err->phrases[i]->string);
     }
 
-    // 5. Init I2S1 slave for mic
+    // 6. Init I2S1 slave for mic
     if (mic_i2s_init(44100) != ESP_OK) {
         ESP_LOGE(TAG_VSR, "mic I2S1 init failed");
         return;
     }
 
-    // 6. Drain any stale reference data accumulated before voice_sr started
+    // 7. Drain any stale reference data accumulated before voice_sr started
     {
         StreamBufferHandle_t ref = audio_get_ref_stream();
         if (ref) {
@@ -447,12 +477,13 @@ void voice_sr_init(void)
         }
     }
 
-    // 7. Launch tasks
-    xTaskCreatePinnedToCoreWithCaps(feed_task,  "voice_feed",  8192, nullptr, 5, nullptr, 0,
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // 8. Launch tasks — use SPIRAM stacks to save scarce internal RAM (54 KB free)
+    // fetch_task runs AEC + WakeNet inside afe->fetch(), needs ≥ 12 KB stack; use 16 KB.
+    xTaskCreatePinnedToCoreWithCaps(feed_task,  "voice_feed",  8192,  nullptr, 5, nullptr, 0,
+                                    MALLOC_CAP_SPIRAM);
     vTaskDelay(pdMS_TO_TICKS(10));
-    xTaskCreatePinnedToCoreWithCaps(fetch_task, "voice_fetch", 8192, nullptr, 5, nullptr, 1,
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    xTaskCreatePinnedToCoreWithCaps(fetch_task, "voice_fetch", 16384, nullptr, 5, nullptr, 1,
+                                    MALLOC_CAP_SPIRAM);
 
     ESP_LOGI(TAG_VSR, "Started — AFE+AEC active — say 'Hi ESP'");
 }

@@ -7,6 +7,7 @@ idf_component_register(
         "nvs_state.cpp"
         "buttons.cpp"
         "voice_sr.cpp"
+        "sprite_anim.cpp"
         "font_cubic11_11.c"
         "font_cubic11_14.c"
     INCLUDE_DIRS

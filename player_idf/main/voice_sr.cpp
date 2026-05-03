@@ -244,17 +244,25 @@ static void fetch_task(void *arg)
 
         int fetch_chunk = s_afe_fetch_chunk; // samples in result->data
 
-        // Periodic RawRMS diagnostic every 2 s
+        // Periodic RawRMS diagnostic every 2 s; always log non-zero wakeup_state
         {
             uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            if (now - last_diag > 2000) {
+            int wstate = (int)result->wakeup_state;
+            if (wstate != 0) {
+                // log immediately whenever WakeNet reports anything
+                int64_t s2 = 0;
+                for (int i = 0; i < fetch_chunk; i++)
+                    s2 += (int64_t)result->data[i] * result->data[i];
+                ESP_LOGI(TAG_VSR, "WAKEUP_STATE=%d RawRMS=%d (NEAR TRIGGER?)",
+                    wstate, (int)sqrtf((float)(s2 / fetch_chunk)));
+            } else if (now - last_diag > 2000) {
                 last_diag = now;
                 int64_t s2 = 0;
                 for (int i = 0; i < fetch_chunk; i++)
                     s2 += (int64_t)result->data[i] * result->data[i];
                 ESP_LOGI(TAG_VSR, "RawRMS=%d mn_active=%d wakeup=%d",
                     (int)sqrtf((float)(s2 / fetch_chunk)),
-                    mn_active ? 1 : 0, (int)result->wakeup_state);
+                    mn_active ? 1 : 0, wstate);
             }
         }
 
@@ -367,9 +375,9 @@ void voice_sr_init(void)
 
     // 3. Configure AFE: single mic (M mode), no AEC.
     // AEC was disabled because I2S0 DMA latency (~185ms at 22050 Hz) exceeds
-    // aec_filter_length=4 coverage (128ms), causing AEC to misalign reference
-    // and cancel voice instead of echo. M mode gives clean signal to WakeNet.
-    // AFE_MODE_HIGH_PERF for maximum wake word detection accuracy (per XiaoZhi reference).
+    // aec_filter_length coverage, causing AEC to cancel voice instead of echo.
+    // Config closely follows XiaoZhi reference: AFE_TYPE_SR + AFE_MODE_HIGH_PERF,
+    // no afe_config_check(), AFE task on Core 1 (separate from feed_task on Core 0).
     afe_config_t *afe_config = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
     if (!afe_config) {
         ESP_LOGE(TAG_VSR, "afe_config_init failed");
@@ -379,17 +387,16 @@ void voice_sr_init(void)
     afe_config->se_init                = false;
     afe_config->ns_init                = false;
     afe_config->vad_init               = false;
-    afe_config->agc_init               = true;
-    afe_config->agc_mode               = AFE_AGC_MODE_WAKENET;
+    afe_config->agc_init               = false;    // disable AGC — let WakeNet see raw resampled signal
     afe_config->wakenet_init           = true;
     afe_config->wakenet_model_name     = wn_name;
     afe_config->wakenet_mode           = DET_MODE_95;
     afe_config->memory_alloc_mode      = AFE_MEMORY_ALLOC_MORE_PSRAM;
     afe_config->afe_ringbuf_size       = 50;
-    afe_config->afe_perferred_core     = 0;
-    afe_config->afe_perferred_priority = 5;
-    afe_config = afe_config_check(afe_config);
-    ESP_LOGI(TAG_VSR, "AFE wakenet_model_name after check: %s",
+    afe_config->afe_perferred_core     = 1;        // WakeNet runs on Core 1 (feed_task is on Core 0)
+    afe_config->afe_perferred_priority = 1;        // low priority, avoids starving feed_task
+    // NOTE: do NOT call afe_config_check() — it can silently override settings
+    ESP_LOGI(TAG_VSR, "AFE wakenet_model_name: %s",
              afe_config->wakenet_model_name ? afe_config->wakenet_model_name : "NULL");
 
     s_afe = esp_afe_handle_from_config(afe_config);

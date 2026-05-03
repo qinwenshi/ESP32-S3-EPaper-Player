@@ -905,7 +905,7 @@ static void setup_task(void *)
     codec_set_sample_rate(44100);
     codec_set_volume(40);
     codec_enable_mic(true);
-    codec_set_mic_gain(6);   // 36 dB — lower than 42 dB to match WakeNet expected input level
+    codec_set_mic_gain(7);   // 42 dB max hardware PGA — no SW gain anymore, use full HW gain
     codec_read_all();
 
     // ── Voice recognition ──

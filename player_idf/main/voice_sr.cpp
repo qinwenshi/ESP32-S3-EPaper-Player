@@ -184,10 +184,11 @@ static void feed_task(void *arg)
         }
         int actual_frames = (int)(bytes_read / 8);
 
-        // Extract mic L channel: ES8311 ADC audio in bits[31:16] of 32-bit slot
+        // Extract mic L channel: ES8311 ADC audio in bits[31:16] of 32-bit slot.
+        // NO software gain — 36 dB hardware PGA is sufficient.
+        // 2× SW gain caused hard clipping (peaks > 32767), distorting WakeNet features.
         for (int i = 0; i < actual_frames; i++) {
-            int v = (int)(int16_t)(stereo[i * 2] >> 16) * 2;  // 2× SW gain
-            mic_raw[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+            mic_raw[i] = (int16_t)(stereo[i * 2] >> 16);
         }
 
         // Resample mic from in_rate → 16kHz
@@ -239,29 +240,27 @@ static void fetch_task(void *arg)
     uint32_t last_diag  = 0;
 
     for (;;) {
-        afe_fetch_result_t *result = s_afe->fetch(s_afe_data);
+        // fetch_with_delay(portMAX_DELAY) blocks until data is ready (no 2s timeout like fetch())
+        afe_fetch_result_t *result = s_afe->fetch_with_delay(s_afe_data, portMAX_DELAY);
         if (!result || result->ret_value != ESP_OK) continue;
 
         int fetch_chunk = s_afe_fetch_chunk; // samples in result->data
 
-        // Periodic RawRMS diagnostic every 2 s; always log non-zero wakeup_state
+        // Periodic diagnostic every 2 s; immediately log any non-zero wakeup_state
         {
             uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
             int wstate = (int)result->wakeup_state;
             if (wstate != 0) {
-                // log immediately whenever WakeNet reports anything
-                int64_t s2 = 0;
-                for (int i = 0; i < fetch_chunk; i++)
-                    s2 += (int64_t)result->data[i] * result->data[i];
-                ESP_LOGI(TAG_VSR, "WAKEUP_STATE=%d RawRMS=%d (NEAR TRIGGER?)",
-                    wstate, (int)sqrtf((float)(s2 / fetch_chunk)));
+                ESP_LOGI(TAG_VSR, "WAKEUP_STATE=%d vol=%.1fdB rbuf_free=%.2f",
+                    wstate, result->data_volume, result->ringbuff_free_pct);
             } else if (now - last_diag > 2000) {
                 last_diag = now;
                 int64_t s2 = 0;
                 for (int i = 0; i < fetch_chunk; i++)
                     s2 += (int64_t)result->data[i] * result->data[i];
-                ESP_LOGI(TAG_VSR, "RawRMS=%d mn_active=%d wakeup=%d",
+                ESP_LOGI(TAG_VSR, "RawRMS=%d vol=%.1fdB rbuf=%.2f mn=%d wakeup=%d",
                     (int)sqrtf((float)(s2 / fetch_chunk)),
+                    result->data_volume, result->ringbuff_free_pct,
                     mn_active ? 1 : 0, wstate);
             }
         }

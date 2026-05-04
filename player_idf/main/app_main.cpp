@@ -213,6 +213,17 @@ static void lvgl_tick_task(void*)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Volume helpers  (declared here so build_screen() can use them)
+// ─────────────────────────────────────────────────────────────────────────────
+static const char *vol_label_str(int idx)
+{
+    static const char *labels[] = {"|...", "||..", "|||.", "||||"};
+    if (idx < 0) idx = 0;
+    if (idx >= VOL_N) idx = VOL_N - 1;
+    return labels[idx];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Build player screen
 // ─────────────────────────────────────────────────────────────────────────────
 static void build_screen()
@@ -282,7 +293,7 @@ static void build_screen()
     lv_obj_set_width(lbl_ctrl, EPD_W - 22);
     lv_obj_set_pos(lbl_ctrl, 2, CTRL_Y);
     lv_obj_set_style_text_font(lbl_ctrl, &font_cubic11_11, 0);
-    lv_label_set_text(lbl_ctrl, "BOOT:暂停 双击:音量\nPWR:下一首 长按:上一首");
+    lv_label_set_text(lbl_ctrl, "BOOT:暂停 双击:音量\nPWR:下一首/上一首");
 
     lbl_play_icon = lv_label_create(scr);
     lv_obj_set_width(lbl_play_icon, 20);
@@ -290,26 +301,18 @@ static void build_screen()
     lv_obj_set_style_text_font(lbl_play_icon, &lv_font_montserrat_12, 0);
     lv_label_set_text(lbl_play_icon, LV_SYMBOL_PLAY);
 
+    // ── Volume icon — top-right corner (clear of sprite x=52..148) ──
     lbl_vol = lv_label_create(scr);
-    lv_obj_set_width(lbl_vol, 22);
-    lv_obj_set_pos(lbl_vol, EPD_W - 22, CTRL_Y + 14);
+    lv_obj_set_width(lbl_vol, 46);
+    lv_obj_set_pos(lbl_vol, EPD_W - 48, SPRITE_Y + 2);  // x=152, y=4
     lv_obj_set_style_text_font(lbl_vol, &font_cubic11_11, 0);
-    lv_obj_set_style_text_align(lbl_vol, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(lbl_vol, "v2");
+    lv_obj_set_style_text_align(lbl_vol, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(lbl_vol, vol_label_str(g_vol_idx));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Volume helpers
 // ─────────────────────────────────────────────────────────────────────────────
-static const char *vol_label_str(int idx)
-{
-    // Simple 4-bar display: filled "|" + empty "." per level
-    static const char *labels[] = {"|...", "||..", "|||.", "||||"};
-    if (idx < 0) idx = 0;
-    if (idx >= VOL_N) idx = VOL_N - 1;
-    return labels[idx];
-}
-
 static void cycle_volume()
 {
     g_vol_idx = (g_vol_idx + 1) % VOL_N;

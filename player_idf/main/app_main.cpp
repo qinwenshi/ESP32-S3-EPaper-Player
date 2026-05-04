@@ -136,15 +136,13 @@ static bool     g_full_refresh_pending = false;
 static uint32_t g_last_track_btn_ms    = 0;
 
 // ── Voice mute management ─────────────────────────────────────────────────────
-
+// (removed — voice SR disabled)
 
 // ── Volume levels (4 steps) ───────────────────────────────────────────────────
 static const int VOL_LEVELS[] = {25, 50, 75, 100};
 static const int VOL_N        = 4;
 static int       g_vol_idx    = 1;   // default: index 1 = 50%
 
-// ── Double-click detection for BOOT ──────────────────────────────────────────
-static uint32_t s_boot_click1_ms = 0;  // time of first short BOOT press; 0=none pending
 
 // ── NVS playback state ────────────────────────────────────────────────────────
 static uint32_t g_restore_pos_sec  = 0;
@@ -649,43 +647,25 @@ static void main_task(void *)
     static bool     s_was_playing  = true;
 
     for (;;) {
-        // ── Button: BOOT ──
-        uint32_t held = 0;
-        if (buttons_boot_fired(&held)) {
-            uint32_t now = millis();
-            if (now - g_last_track_btn_ms > 500) {
-                if (held > 50) {
-                    // Short press: check for double-click (volume) vs single-click (pause)
-                    if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) < 400) {
-                        // ── Double-click → cycle volume ──
-                        uint32_t interval_ms = now - s_boot_click1_ms;
-                        s_boot_click1_ms = 0;
-                        ESP_LOGI(TAG, "[BOOT] Double-click (interval=%lums) → volume cycle", (unsigned long)interval_ms);
-                        cycle_volume();
-                    } else {
-                        // ── First click — defer for 350 ms to catch potential double-click ──
-                        s_boot_click1_ms = now;
-                    }
-                }
-            }
+        // ── Button: BOOT double-click → cycle volume ──────────────────────────
+        if (buttons_boot_double_fired()) {
+            ESP_LOGI(TAG, "[BOOT] Double-click → volume cycle");
+            cycle_volume();
         }
 
-        // ── Pending single-click: fire pause/resume after 500 ms double-click window ──
-        // (500ms > 400ms double-click window, ensuring double-click is never pre-empted)
-        {
-            uint32_t now = millis();
-            if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) >= 500) {
-                s_boot_click1_ms = 0;
-                is_playing = !is_playing;
-                audio_pause_resume();
-                g_prescan_allowed = !is_playing;
-                if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    lv_label_set_text(lbl_play_icon,
-                        is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
-                    sprite_anim_set_state(
-                        is_playing ? SPRITE_STATE_IDLE : SPRITE_STATE_WAITING, false);
-                    xSemaphoreGive(lvgl_mtx);
-                }
+        // ── Button: BOOT single-click → pause / resume ────────────────────────
+        uint32_t held = 0;
+        if (buttons_boot_fired(&held)) {
+            ESP_LOGI(TAG, "[BOOT] Single-click (held=%lums) → pause/resume", (unsigned long)held);
+            is_playing = !is_playing;
+            audio_pause_resume();
+            g_prescan_allowed = !is_playing;
+            if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+                lv_label_set_text(lbl_play_icon,
+                    is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+                sprite_anim_set_state(
+                    is_playing ? SPRITE_STATE_IDLE : SPRITE_STATE_WAITING, false);
+                xSemaphoreGive(lvgl_mtx);
             }
         }
 

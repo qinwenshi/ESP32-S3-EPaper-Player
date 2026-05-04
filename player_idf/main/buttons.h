@@ -9,8 +9,13 @@ extern "C" {
 
 void buttons_init(int boot_pin, int pwr_pin);
 
-// Returns true once (clears flag).  held_ms = how long the button was held.
+// Single-click: short press (20-1200 ms) not followed by a second press within 400 ms.
+// held_ms = press duration.
 bool buttons_boot_fired(uint32_t *held_ms);
+
+// Double-click: two short presses with release-to-release gap < 400 ms.
+bool buttons_boot_double_fired(void);
+
 bool buttons_pwr_fired(uint32_t *held_ms);
 
 #ifdef __cplusplus

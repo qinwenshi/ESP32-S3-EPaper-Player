@@ -36,7 +36,7 @@
 #include "codec.h"
 #include "nvs_state.h"
 #include "buttons.h"
-#include "voice_sr.h"
+
 #include "sprite_anim.h"
 #include "snail_icon.h"
 
@@ -136,9 +136,7 @@ static bool     g_full_refresh_pending = false;
 static uint32_t g_last_track_btn_ms    = 0;
 
 // ── Voice mute management ─────────────────────────────────────────────────────
-static bool     g_voice_muted      = false;
-static uint8_t  g_saved_vol        = 40;
-static bool     g_voice_was_paused = false;
+
 
 // ── Volume levels (4 steps) ───────────────────────────────────────────────────
 static const int VOL_LEVELS[] = {25, 50, 75, 100};
@@ -528,7 +526,6 @@ static void on_meta(const char *key, const char *value)
         uint32_t sr = (uint32_t)atoi(value);
         if (sr >= 8000 && sr <= 96000) {
             codec_set_sample_rate(sr);
-            voice_sr_set_input_rate(sr);
             ESP_LOGI(TAG, "Sample rate -> %u Hz", sr);
         }
     }
@@ -689,24 +686,6 @@ static void main_task(void *)
             }
         }
 
-        // ── Restore volume after voice ──
-        if (g_voice_muted && !voice_sr_is_listening()) {
-            codec_dac_mute(false);
-            codec_set_volume(g_saved_vol);
-            g_voice_muted = false;
-            if (g_voice_was_paused) {
-                audio_pause_resume();
-                is_playing = false;
-                g_voice_was_paused = false;
-                if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    lv_label_set_text(lbl_play_icon, LV_SYMBOL_PAUSE);
-                    sprite_anim_set_state(SPRITE_STATE_WAITING, false);
-                    xSemaphoreGive(lvgl_mtx);
-                }
-            }
-            ESP_LOGI(TAG, "[VOICE] DAC restored");
-        }
-
         // ── Button: PWR ──
         if (buttons_pwr_fired(&held)) {
             uint32_t now = millis();
@@ -716,55 +695,6 @@ static void main_task(void *)
                     play_track(cur_track - 1, -1);
                 } else {
                     play_track(cur_track + 1, +1);
-                }
-            }
-        }
-
-        // ── Voice commands ──
-        {
-            int vcmd = voice_sr_get_cmd();
-            if (vcmd != VOICE_CMD_NONE) {
-                ESP_LOGI(TAG, "[VOICE] Executing command %d", vcmd);
-                switch (vcmd) {
-                    case VOICE_CMD_NEXT:
-                        play_track(cur_track + 1, +1);
-                        break;
-                    case VOICE_CMD_PREV:
-                        play_track(cur_track - 1, -1);
-                        break;
-                    case VOICE_CMD_PAUSE:
-                        if (is_playing) {
-                            is_playing = false; audio_pause_resume();
-                            g_prescan_allowed = true;
-                            if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                                lv_label_set_text(lbl_play_icon, LV_SYMBOL_PAUSE);
-                                sprite_anim_set_state(SPRITE_STATE_WAITING, false);
-                                xSemaphoreGive(lvgl_mtx);
-                            }
-                        }
-                        break;
-                    case VOICE_CMD_RESUME:
-                        if (!is_playing) {
-                            is_playing = true; audio_pause_resume();
-                            g_prescan_allowed = false;
-                            if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                                lv_label_set_text(lbl_play_icon, LV_SYMBOL_PLAY);
-                                sprite_anim_set_state(SPRITE_STATE_IDLE, false);
-                                xSemaphoreGive(lvgl_mtx);
-                            }
-                        }
-                        break;
-                    case VOICE_CMD_VOL_UP:
-                        codec_set_volume(std::min(100, (int)codec_get_volume() + 10));
-                        if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                            sprite_anim_set_state(SPRITE_STATE_JUMPING, true);
-                            xSemaphoreGive(lvgl_mtx);
-                        }
-                        break;
-                    case VOICE_CMD_VOL_DOWN:
-                        codec_set_volume(std::max(0, (int)codec_get_volume() - 10));
-                        break;
-                    default: break;
                 }
             }
         }
@@ -974,15 +904,6 @@ static void setup_task(void *)
     codec_enable_mic(true);
     codec_set_mic_gain(7);   // 42 dB max hardware PGA — no SW gain anymore, use full HW gain
     codec_read_all();
-
-    // ── Voice recognition ──
-    ESP_LOGI("player", "Before voice_sr: free internal=%u SPIRAM=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    voice_sr_init();
-    ESP_LOGI("player", "After  voice_sr: free internal=%u SPIRAM=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     // ── Buttons ──
     buttons_init(BOOT_BTN, PWR_BTN);

@@ -148,7 +148,7 @@ static uint32_t g_last_flush_ms    = 0;
 static bool     g_silent_flush     = false;
 static int      g_partial_count    = 0;    // partial refreshes since last full refresh
 #define MIN_FLUSH_MS                 160
-#define PARTIAL_FULL_REFRESH_INTERVAL 200  // force full refresh every N partials (~1 min at 300ms/partial)
+#define PARTIAL_FULL_REFRESH_INTERVAL 500  // fallback: force full refresh every N partials if no track change
 
 // ── EOF auto-advance debounce ─────────────────────────────────────────────────
 static uint32_t g_eof_debounce = 0;
@@ -763,6 +763,7 @@ static void main_task(void *)
             if (millis() - g_eof_debounce > 800) {
                 g_eof_debounce = 0;
                 g_audio_eof    = false;
+                g_full_refresh_pending = true;  // full refresh between tracks
                 play_track(cur_track + 1, 0);  // direction=0 → 'running' animation
             }
         } else {

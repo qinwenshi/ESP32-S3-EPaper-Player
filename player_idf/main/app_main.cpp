@@ -319,7 +319,8 @@ static void cycle_volume()
         lv_label_set_text(lbl_vol, vol_label_str(g_vol_idx));
         xSemaphoreGive(lvgl_mtx);
     }
-    ESP_LOGI(TAG, "Volume: level %d → %d%%", g_vol_idx + 1, VOL_LEVELS[g_vol_idx]);
+    ESP_LOGI(TAG, "Volume → level %d/4 (%d%%) %s",
+             g_vol_idx + 1, VOL_LEVELS[g_vol_idx], vol_label_str(g_vol_idx));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -657,7 +658,9 @@ static void main_task(void *)
                     // Short press: check for double-click (volume) vs single-click (pause)
                     if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) < 400) {
                         // ── Double-click → cycle volume ──
+                        uint32_t interval_ms = now - s_boot_click1_ms;
                         s_boot_click1_ms = 0;
+                        ESP_LOGI(TAG, "[BOOT] Double-click (interval=%lums) → volume cycle", (unsigned long)interval_ms);
                         cycle_volume();
                     } else {
                         // ── First click — defer for 350 ms to catch potential double-click ──

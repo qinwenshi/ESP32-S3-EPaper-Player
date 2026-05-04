@@ -670,10 +670,11 @@ static void main_task(void *)
             }
         }
 
-        // ── Pending single-click: fire pause/resume after 350 ms double-click window ──
+        // ── Pending single-click: fire pause/resume after 500 ms double-click window ──
+        // (500ms > 400ms double-click window, ensuring double-click is never pre-empted)
         {
             uint32_t now = millis();
-            if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) >= 350) {
+            if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) >= 500) {
                 s_boot_click1_ms = 0;
                 is_playing = !is_playing;
                 audio_pause_resume();

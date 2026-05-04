@@ -167,21 +167,37 @@ static void feed_task(void *arg)
         vTaskDelete(nullptr); return;
     }
 
-    uint32_t last_rms_log = 0;
-    int zero_rms_count = 0;
+    uint32_t last_rms_log   = 0;
+    int      zero_rms_count = 0;
+    int      resync_count   = 0;          // consecutive failed resyncs
+    uint32_t resync_cooldown_until = 0;   // stop resyncing until this time
     ESP_LOGI(TAG_VSR, "feed_task started — feed_chunk=%d", s_afe_feed_chunk);
 
     for (;;) {
         // Reset I2S1 slave if I2S0 clock was reconfigured (rate change or zero-mic watchdog).
-        // After I2S0 disable→enable, I2S1 loses stereo frame alignment; a disable→enable
-        // of I2S1 forces the DMA to resync with the restarted BCLK/WS signals.
         if (s_mic_reset_req) {
             s_mic_reset_req = false;
             zero_rms_count  = 0;
-            vTaskDelay(pdMS_TO_TICKS(30));  // let I2S0 finish its clock reconfigure
+
+            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (now_ms < resync_cooldown_until) {
+                // In cooldown — skip resync to avoid infinite loop
+                continue;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(30));  // let I2S0 finish clock reconfigure
             i2s_channel_disable(s_mic_rx);
             i2s_channel_enable(s_mic_rx);
-            ESP_LOGI(TAG_VSR, "I2S1 mic resynced after rate change");
+            vTaskDelay(pdMS_TO_TICKS(200)); // let DMA fill with real data before reading
+            ESP_LOGI(TAG_VSR, "I2S1 mic resynced (attempt %d)", resync_count + 1);
+
+            resync_count++;
+            if (resync_count >= 5) {
+                // 5 consecutive failed resyncs — back off for 30 s
+                resync_cooldown_until = now_ms + 30000;
+                resync_count = 0;
+                ESP_LOGW(TAG_VSR, "Mic resync failed %d times — backing off 30 s", 5);
+            }
             continue;
         }
 
@@ -209,16 +225,18 @@ static void feed_task(void *arg)
             raw_sum2 += (int64_t)mic_raw[i] * mic_raw[i];
         }
 
-        // Zero-RMS watchdog: if mic is silent for 3 consecutive reads (~600ms),
-        // I2S1 slave has lost frame alignment — force a resync.
+        // Zero-RMS watchdog: only trigger when DMA returns EXACT zeros (all samples == 0),
+        // which indicates a genuine I2S1 frame-alignment loss, not quiet audio.
+        // Require 10 consecutive zero reads (~2s at 200ms/read) to avoid false triggers.
         int mic_rms = (actual_frames > 0) ? (int)sqrtf((float)(raw_sum2 / actual_frames)) : 0;
-        if (mic_rms < 5) {
-            if (++zero_rms_count >= 3) {
-                ESP_LOGW(TAG_VSR, "Mic silence detected (%d reads) — resyncing I2S1", zero_rms_count);
+        if (mic_rms == 0) {
+            if (++zero_rms_count >= 10) {
+                ESP_LOGW(TAG_VSR, "Mic DMA stuck (%d reads) — resyncing I2S1", zero_rms_count);
                 s_mic_reset_req = true;
             }
         } else {
             zero_rms_count = 0;
+            resync_count   = 0;  // successful read — reset backoff counter
         }
 
         // Resample mic from in_rate → 16kHz

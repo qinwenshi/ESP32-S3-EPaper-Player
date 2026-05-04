@@ -116,6 +116,7 @@ static lv_obj_t *lbl_time;
 static lv_obj_t *bar_prog;
 static lv_obj_t *lbl_ctrl;
 static lv_obj_t *lbl_play_icon;
+static lv_obj_t *lbl_vol;
 static lv_obj_t *img_snail;
 
 LV_FONT_DECLARE(font_cubic11_14)
@@ -138,6 +139,14 @@ static uint32_t g_last_track_btn_ms    = 0;
 static bool     g_voice_muted      = false;
 static uint8_t  g_saved_vol        = 40;
 static bool     g_voice_was_paused = false;
+
+// ── Volume levels (4 steps) ───────────────────────────────────────────────────
+static const int VOL_LEVELS[] = {25, 50, 75, 100};
+static const int VOL_N        = 4;
+static int       g_vol_idx    = 1;   // default: index 1 = 50%
+
+// ── Double-click detection for BOOT ──────────────────────────────────────────
+static uint32_t s_boot_click1_ms = 0;  // time of first short BOOT press; 0=none pending
 
 // ── NVS playback state ────────────────────────────────────────────────────────
 static uint32_t g_restore_pos_sec  = 0;
@@ -273,13 +282,43 @@ static void build_screen()
     lv_obj_set_width(lbl_ctrl, EPD_W - 22);
     lv_obj_set_pos(lbl_ctrl, 2, CTRL_Y);
     lv_obj_set_style_text_font(lbl_ctrl, &font_cubic11_11, 0);
-    lv_label_set_text(lbl_ctrl, "BOOT:暂停  PWR:下一首\nPWR长按:上一首");
+    lv_label_set_text(lbl_ctrl, "BOOT:暂停 双击:音量\nPWR:下一首 长按:上一首");
 
     lbl_play_icon = lv_label_create(scr);
-    lv_obj_set_width(lbl_play_icon, 18);
-    lv_obj_set_pos(lbl_play_icon, EPD_W - 20, CTRL_Y + 6);
+    lv_obj_set_width(lbl_play_icon, 20);
+    lv_obj_set_pos(lbl_play_icon, EPD_W - 21, CTRL_Y + 2);
     lv_obj_set_style_text_font(lbl_play_icon, &lv_font_montserrat_12, 0);
     lv_label_set_text(lbl_play_icon, LV_SYMBOL_PLAY);
+
+    lbl_vol = lv_label_create(scr);
+    lv_obj_set_width(lbl_vol, 22);
+    lv_obj_set_pos(lbl_vol, EPD_W - 22, CTRL_Y + 14);
+    lv_obj_set_style_text_font(lbl_vol, &font_cubic11_11, 0);
+    lv_obj_set_style_text_align(lbl_vol, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(lbl_vol, "v2");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Volume helpers
+// ─────────────────────────────────────────────────────────────────────────────
+static const char *vol_label_str(int idx)
+{
+    // Simple 4-bar display: filled "|" + empty "." per level
+    static const char *labels[] = {"|...", "||..", "|||.", "||||"};
+    if (idx < 0) idx = 0;
+    if (idx >= VOL_N) idx = VOL_N - 1;
+    return labels[idx];
+}
+
+static void cycle_volume()
+{
+    g_vol_idx = (g_vol_idx + 1) % VOL_N;
+    codec_set_volume(VOL_LEVELS[g_vol_idx]);
+    if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+        lv_label_set_text(lbl_vol, vol_label_str(g_vol_idx));
+        xSemaphoreGive(lvgl_mtx);
+    }
+    ESP_LOGI(TAG, "Volume: level %d → %d%%", g_vol_idx + 1, VOL_LEVELS[g_vol_idx]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,16 +676,33 @@ static void main_task(void *)
                     voice_sr_start_listen();
                     ESP_LOGI(TAG, "[VOICE] Long press — speak command now");
                 } else if (held > 50) {
-                    is_playing = !is_playing;
-                    audio_pause_resume();
-                    g_prescan_allowed = !is_playing;
-                    if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        lv_label_set_text(lbl_play_icon,
-                            is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
-                        sprite_anim_set_state(
-                            is_playing ? SPRITE_STATE_IDLE : SPRITE_STATE_WAITING, false);
-                        xSemaphoreGive(lvgl_mtx);
+                    // Short press: check for double-click (volume) vs single-click (pause)
+                    if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) < 400) {
+                        // ── Double-click → cycle volume ──
+                        s_boot_click1_ms = 0;
+                        cycle_volume();
+                    } else {
+                        // ── First click — defer for 350 ms to catch potential double-click ──
+                        s_boot_click1_ms = now;
                     }
+                }
+            }
+        }
+
+        // ── Pending single-click: fire pause/resume after 350 ms double-click window ──
+        {
+            uint32_t now = millis();
+            if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) >= 350) {
+                s_boot_click1_ms = 0;
+                is_playing = !is_playing;
+                audio_pause_resume();
+                g_prescan_allowed = !is_playing;
+                if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    lv_label_set_text(lbl_play_icon,
+                        is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+                    sprite_anim_set_state(
+                        is_playing ? SPRITE_STATE_IDLE : SPRITE_STATE_WAITING, false);
+                    xSemaphoreGive(lvgl_mtx);
                 }
             }
         }
@@ -932,7 +988,7 @@ static void setup_task(void *)
         ESP_LOGE(TAG, "ES8311 not found! Check wiring.");
     }
     codec_set_sample_rate(44100);
-    codec_set_volume(40);
+    codec_set_volume(VOL_LEVELS[g_vol_idx]);  // default: level 2 = 50%
     codec_enable_mic(true);
     codec_set_mic_gain(7);   // 42 dB max hardware PGA — no SW gain anymore, use full HW gain
     codec_read_all();

@@ -92,10 +92,11 @@ static inline void delay_ms(uint32_t ms) {
 
 #define TITLE_Y    (SPRITE_Y + SPRITE_DISP_H + 4)       // = 110
 #define ARTIST_Y   (TITLE_Y + 14)                       // = 124
-#define PROG_Y     (ARTIST_Y + 12)                      // = 136
+#define FOLDER_Y   (ARTIST_Y + 13)                      // = 137
+#define PROG_Y     (FOLDER_Y + 13 + 4)                  // = 154  (gap before bar)
 #define PROG_H     3
-#define SEP_Y      (PROG_Y + PROG_H + 4)                // = 143
-#define CTRL_Y     (SEP_Y + 2)                          // = 145
+#define SEP_Y      (PROG_Y + PROG_H + 4)                // = 161
+#define CTRL_Y     (SEP_Y + 2)                          // = 163
 
 #define SNAIL_OBJ_Y   (PROG_Y + PROG_H/2 - SNAIL_H/2)
 
@@ -110,6 +111,7 @@ static lv_display_t      *disp = nullptr;
 static lv_obj_t *img_sprite;
 static lv_obj_t *lbl_title;
 static lv_obj_t *lbl_artist;
+static lv_obj_t *lbl_folder;
 static lv_obj_t *lbl_time;
 static lv_obj_t *bar_prog;
 static lv_obj_t *lbl_ctrl;
@@ -125,6 +127,7 @@ static int     cur_track  = 0;
 static bool    is_playing = false;
 static char    g_title[128]  = "No Track";
 static char    g_artist[64]  = "";
+static char    g_folder[64]  = "";
 static char    g_cur_file[256] = "";
 static uint32_t g_track_start_ms  = 0;
 static bool     g_meta_needs_save = false;
@@ -227,6 +230,13 @@ static void build_screen()
     lv_label_set_long_mode(lbl_artist, LV_LABEL_LONG_DOT);
     lv_label_set_text(lbl_artist, "");
 
+    lbl_folder = lv_label_create(scr);
+    lv_obj_set_width(lbl_folder, EPD_W - 4);
+    lv_obj_set_pos(lbl_folder, 2, FOLDER_Y);
+    lv_obj_set_style_text_font(lbl_folder, &font_cubic11_11, 0);
+    lv_label_set_long_mode(lbl_folder, LV_LABEL_LONG_DOT);
+    lv_label_set_text(lbl_folder, "");
+
     lbl_time = lv_label_create(scr);
     lv_obj_set_width(lbl_time, 76);
     lv_obj_set_pos(lbl_time, EPD_W - 78, ARTIST_Y);
@@ -276,6 +286,7 @@ static void refresh_ui()
 {
     lv_label_set_text(lbl_title,  g_title[0] ? g_title : "No Track");
     lv_label_set_text(lbl_artist, g_artist);
+    lv_label_set_text(lbl_folder, g_folder);
 
     uint32_t cur = audio_get_current_time();
     uint32_t tot = audio_get_duration();
@@ -513,12 +524,21 @@ static void play_track(int idx, int direction = 0)
 
     memset(g_title,  0, sizeof(g_title));
     memset(g_artist, 0, sizeof(g_artist));
+    memset(g_folder, 0, sizeof(g_folder));
     g_meta_needs_save = false;
     g_track_start_ms  = millis();
 
     std::string fname(path);
     size_t s = fname.rfind('/'), d = fname.rfind('.');
     std::string base = fname.substr(s + 1, d - s - 1);
+    // Extract parent folder name (one level up from the file)
+    if (s != std::string::npos && s > 0) {
+        size_t s2 = fname.rfind('/', s - 1);
+        std::string folder = (s2 != std::string::npos)
+                             ? fname.substr(s2 + 1, s - s2 - 1)
+                             : fname.substr(0, s);
+        strncpy(g_folder, folder.c_str(), sizeof(g_folder)-1);
+    }
     size_t sep = base.find(" - ");
     if (sep != std::string::npos) {
         strncpy(g_artist, base.substr(0, sep).c_str(), sizeof(g_artist)-1);

@@ -148,7 +148,7 @@ static uint32_t g_last_flush_ms    = 0;
 static bool     g_silent_flush     = false;
 static int      g_partial_count    = 0;    // partial refreshes since last full refresh
 #define MIN_FLUSH_MS                 160
-#define PARTIAL_FULL_REFRESH_INTERVAL 20   // force full refresh every N partials (datasheet: prevents ghosting/damage)
+#define PARTIAL_FULL_REFRESH_INTERVAL 200  // force full refresh every N partials (~1 min at 300ms/partial)
 
 // ── EOF auto-advance debounce ─────────────────────────────────────────────────
 static uint32_t g_eof_debounce = 0;

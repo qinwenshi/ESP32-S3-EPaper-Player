@@ -45,6 +45,8 @@ static volatile int              g_voice_cmd    = VOICE_CMD_NONE;
 static volatile uint32_t         g_in_rate      = 44100;
 static volatile bool             s_listen_req   = false;
 static volatile bool             s_mn_active    = false;
+// Set to true when I2S0 clock changes (rate switch) — feed_task will reset I2S1 slave
+static volatile bool             s_mic_reset_req = false;
 
 static i2s_chan_handle_t            s_mic_rx    = nullptr;  // I2S1 slave RX (mic)
 static const esp_afe_sr_iface_t    *s_afe       = nullptr;  // AFE interface (AEC+WakeNet)
@@ -166,9 +168,23 @@ static void feed_task(void *arg)
     }
 
     uint32_t last_rms_log = 0;
+    int zero_rms_count = 0;
     ESP_LOGI(TAG_VSR, "feed_task started — feed_chunk=%d", s_afe_feed_chunk);
 
     for (;;) {
+        // Reset I2S1 slave if I2S0 clock was reconfigured (rate change or zero-mic watchdog).
+        // After I2S0 disable→enable, I2S1 loses stereo frame alignment; a disable→enable
+        // of I2S1 forces the DMA to resync with the restarted BCLK/WS signals.
+        if (s_mic_reset_req) {
+            s_mic_reset_req = false;
+            zero_rms_count  = 0;
+            vTaskDelay(pdMS_TO_TICKS(30));  // let I2S0 finish its clock reconfigure
+            i2s_channel_disable(s_mic_rx);
+            i2s_channel_enable(s_mic_rx);
+            ESP_LOGI(TAG_VSR, "I2S1 mic resynced after rate change");
+            continue;
+        }
+
         uint32_t in_rate = g_in_rate;
         int frames_needed = s_afe_feed_chunk * (int)in_rate / VOICE_SR_HZ + 4;
         if (frames_needed > max_i2s_frames) frames_needed = max_i2s_frames;
@@ -187,8 +203,22 @@ static void feed_task(void *arg)
         // Extract mic L channel: ES8311 ADC audio in bits[31:16] of 32-bit slot.
         // NO software gain — 36 dB hardware PGA is sufficient.
         // 2× SW gain caused hard clipping (peaks > 32767), distorting WakeNet features.
+        int64_t raw_sum2 = 0;
         for (int i = 0; i < actual_frames; i++) {
             mic_raw[i] = (int16_t)(stereo[i * 2] >> 16);
+            raw_sum2 += (int64_t)mic_raw[i] * mic_raw[i];
+        }
+
+        // Zero-RMS watchdog: if mic is silent for 3 consecutive reads (~600ms),
+        // I2S1 slave has lost frame alignment — force a resync.
+        int mic_rms = (actual_frames > 0) ? (int)sqrtf((float)(raw_sum2 / actual_frames)) : 0;
+        if (mic_rms < 5) {
+            if (++zero_rms_count >= 3) {
+                ESP_LOGW(TAG_VSR, "Mic silence detected (%d reads) — resyncing I2S1", zero_rms_count);
+                s_mic_reset_req = true;
+            }
+        } else {
+            zero_rms_count = 0;
         }
 
         // Resample mic from in_rate → 16kHz
@@ -205,11 +235,10 @@ static void feed_task(void *arg)
             uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
             if (now_ms - last_rms_log > 5000) {
                 last_rms_log = now_ms;
-                int64_t s2 = 0, f2 = 0;
-                for (int i = 0; i < actual_frames;    i++) s2 += (int64_t)mic_raw[i] * mic_raw[i];
+                int64_t f2 = 0;
                 for (int i = 0; i < s_afe_feed_chunk; i++) f2 += (int64_t)mic_16k[i] * mic_16k[i];
                 ESP_LOGI(TAG_VSR, "MicRMS=%d FeedRMS=%d rate=%u frames=%d",
-                    (int)sqrtf((float)(s2 / actual_frames)),
+                    mic_rms,
                     (int)sqrtf((float)(f2 / s_afe_feed_chunk)),
                     in_rate, actual_frames);
                 if (actual_frames >= 4) {
@@ -329,7 +358,14 @@ static void fetch_task(void *arg)
 
 void voice_sr_set_input_rate(uint32_t hz)
 {
-    if (hz > 0) g_in_rate = hz;
+    if (hz > 0 && hz != g_in_rate) {
+        g_in_rate = hz;
+        // I2S0 BCLK will be momentarily stopped for the clock reconfigure.
+        // I2S1 slave loses frame sync → flag feed_task to reset I2S1 after the change.
+        s_mic_reset_req = true;
+    } else if (hz > 0) {
+        g_in_rate = hz;
+    }
 }
 
 void voice_sr_start_listen(void)

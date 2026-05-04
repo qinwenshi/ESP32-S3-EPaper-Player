@@ -312,14 +312,19 @@ static void refresh_ui()
 // ─────────────────────────────────────────────────────────────────────────────
 static void epd_full_refresh()
 {
-    g_partial_count = 0;          // reset partial counter after full refresh
-    ESP_LOGI(TAG, "EPD full refresh (partial_count reset)");
-    // The internal EPD buffer is already current from the last partial flush.
-    // EPD_DisplayPartBaseImage() sends it to both display RAMs with the full
-    // waveform LUT, producing the characteristic black→white→image flash.
-    epd->EPD_LoadFullLut();
+    g_partial_count = 0;
+    ESP_LOGI(TAG, "EPD full refresh");
+    // EPD_Init_Partial() changes registers 0x37, 0x3C (BorderWaveform→0x80) and
+    // others that prevent a proper full-waveform flash if we only swap the LUT.
+    // The only reliable way to return to full-refresh mode is EPD_Init(), which
+    // does: HW reset + SW reset + driver output / data-entry / border / temp /
+    // cursor setup + loads WF_Full_1IN54 LUT.
+    epd->EPD_Init();
+    // Write current buffer to both display RAMs (new frame + base frame) and
+    // activate with TurnOnDisplay(0xC7) → full waveform → visible black→white flash.
     epd->EPD_DisplayPartBaseImage();
-    epd->EPD_ReloadPartialLut();
+    // Restore partial-refresh mode for subsequent LVGL-driven updates.
+    epd->EPD_Init_Partial();
 }
 
 static void epd_save_frame()

@@ -187,6 +187,9 @@ static void epd_flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px_map
         epd->EPD_DisplayPart();
         if (++g_partial_count >= PARTIAL_FULL_REFRESH_INTERVAL) {
             g_full_refresh_pending = true;  // trigger full refresh in main_task
+            ESP_LOGI(TAG, "EPD: partial_count=%d → full refresh queued", g_partial_count);
+        } else if (g_partial_count % 5 == 0) {
+            ESP_LOGI(TAG, "EPD: partial_count=%d/%d", g_partial_count, PARTIAL_FULL_REFRESH_INTERVAL);
         }
     }
     lv_display_flush_ready(d);
@@ -310,11 +313,11 @@ static void refresh_ui()
 static void epd_full_refresh()
 {
     g_partial_count = 0;          // reset partial counter after full refresh
+    ESP_LOGI(TAG, "EPD full refresh (partial_count reset)");
+    // The internal EPD buffer is already current from the last partial flush.
+    // EPD_DisplayPartBaseImage() sends it to both display RAMs with the full
+    // waveform LUT, producing the characteristic black→white→image flash.
     epd->EPD_LoadFullLut();
-    g_silent_flush = true;
-    lv_obj_invalidate(lv_screen_active());
-    lv_timer_handler();
-    g_silent_flush = false;
     epd->EPD_DisplayPartBaseImage();
     epd->EPD_ReloadPartialLut();
 }

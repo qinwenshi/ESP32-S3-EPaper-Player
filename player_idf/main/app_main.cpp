@@ -653,29 +653,7 @@ static void main_task(void *)
         if (buttons_boot_fired(&held)) {
             uint32_t now = millis();
             if (now - g_last_track_btn_ms > 500) {
-                if (held > 1200) {
-                    g_last_track_btn_ms = now;
-                    if (!g_voice_muted) {
-                        g_saved_vol   = codec_get_volume();
-                        g_voice_muted = true;
-                        codec_dac_mute(true);
-
-                        g_voice_was_paused = !is_playing;
-                        if (!is_playing) {
-                            is_playing = true;
-                            audio_pause_resume();
-                            ESP_LOGI(TAG, "[VOICE] Resumed I2S clock for mic");
-                        }
-                        delay_ms(300);
-                    }
-                    // Sprite: wave to indicate voice mode
-                    if (xSemaphoreTake(lvgl_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        sprite_anim_set_state(SPRITE_STATE_WAVING, true);
-                        xSemaphoreGive(lvgl_mtx);
-                    }
-                    voice_sr_start_listen();
-                    ESP_LOGI(TAG, "[VOICE] Long press — speak command now");
-                } else if (held > 50) {
+                if (held > 50) {
                     // Short press: check for double-click (volume) vs single-click (pause)
                     if (s_boot_click1_ms != 0 && (now - s_boot_click1_ms) < 400) {
                         // ── Double-click → cycle volume ──
